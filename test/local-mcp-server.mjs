@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import http from "node:http";
 import { randomUUID } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { toNodeHandler } from "@modelcontextprotocol/node";
+import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { createMcpHandler, inputRequired, inputResponse, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 
 const ONE_BY_ONE_PNG =
@@ -27,12 +27,12 @@ function createFixtureServer() {
     {
       title: "Echo",
       description: "Echo a message back as text.",
-      inputSchema: {
-        message: z.string().describe("Message to echo"),
-      },
+      inputSchema: z.object({
+              message: z.string().describe("Message to echo"),
+            }),
     },
-    async ({ message }, extra) => {
-      await server.sendLoggingMessage({ level: "info", data: `echo:${message}` }, extra.sessionId);
+    async ({ message }, ctx) => {
+      await server.sendLoggingMessage({ level: "info", data: `echo:${message}` }, ctx.sessionId);
       return {
         content: [{ type: "text", text: `echo:${message}` }],
       };
@@ -44,15 +44,15 @@ function createFixtureServer() {
     {
       title: "Structured",
       description: "Return structured content and text content.",
-      inputSchema: {
-        label: z.string().describe("Label for the structured result"),
-        count: z.number().int().default(1).describe("Count to return"),
-      },
-      outputSchema: {
-        label: z.string(),
-        count: z.number(),
-        ok: z.boolean(),
-      },
+      inputSchema: z.object({
+              label: z.string().describe("Label for the structured result"),
+              count: z.number().int().default(1).describe("Count to return"),
+            }),
+      outputSchema: z.object({
+              label: z.string(),
+              count: z.number(),
+              ok: z.boolean(),
+            }),
     },
     async ({ label, count }) => {
       const structuredContent = { label, count, ok: true };
@@ -68,7 +68,7 @@ function createFixtureServer() {
     {
       title: "Image",
       description: "Return a tiny PNG image.",
-      inputSchema: {},
+      inputSchema: z.object({}),
     },
     async () => ({
       content: [{ type: "image", mimeType: "image/png", data: ONE_BY_ONE_PNG }],
@@ -80,7 +80,7 @@ function createFixtureServer() {
     {
       title: "Resource Content",
       description: "Return MCP resource content from a tool.",
-      inputSchema: {},
+      inputSchema: z.object({}),
     },
     async () => ({
       content: [
@@ -101,7 +101,7 @@ function createFixtureServer() {
     {
       title: "Fail",
       description: "Return an MCP tool error result.",
-      inputSchema: {},
+      inputSchema: z.object({}),
     },
     async () => ({
       isError: true,
@@ -114,42 +114,56 @@ function createFixtureServer() {
     {
       title: "Elicit Form",
       description: "Request form input from the MCP client.",
-      inputSchema: {},
+      inputSchema: z.object({}),
     },
-    async () => {
-      const result = await server.server.elicitInput({
-        mode: "form",
-        message: "Fixture form request",
-        requestedSchema: {
-          type: "object",
-          properties: {
-            name: {
-              type: "string",
-              title: "Name",
-              description: "Name to return",
-            },
-            count: {
-              type: "integer",
-              title: "Count",
-              description: "Count to return",
-              default: 1,
-            },
-            confirm: {
-              type: "boolean",
-              title: "Confirm",
-              description: "Confirmation flag",
-              default: true,
-            },
-            color: {
-              type: "string",
-              title: "Color",
-              enum: ["red", "green", "blue"],
-              default: "green",
-            },
+    async (_args, ctx) => {
+      const response = inputResponse(ctx.mcpReq.inputResponses, "form");
+      if (response.kind === "missing") {
+        return inputRequired({
+          inputRequests: {
+            form: inputRequired.elicit({
+              message: "Fixture form request",
+              requestedSchema: z.object({
+                name: z.string().describe("Name to return"),
+                count: z.number().int().default(1).describe("Count to return"),
+                confirm: z.boolean().default(true).describe("Confirmation flag"),
+                color: z.enum(["red", "green", "blue"]).default("green").describe("Color"),
+              }),
+            }),
           },
-          required: ["name", "count", "confirm", "color"],
-        },
-      });
+        });
+      }
+      const result =
+        response.kind === "elicit"
+          ? { action: response.action, ...(response.content ? { content: response.content } : {}) }
+          : { action: "decline" };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
+      };
+    },
+  );
+
+  server.registerTool(
+    "elicit_url",
+    {
+      title: "Elicit URL",
+      description: "Request explicit consent before opening a URL.",
+      inputSchema: z.object({}),
+    },
+    async (_args, ctx) => {
+      const response = inputResponse(ctx.mcpReq.inputResponses, "url");
+      if (response.kind === "missing") {
+        return inputRequired({
+          inputRequests: {
+            url: inputRequired.elicitUrl({
+              message: "Fixture URL request",
+              url: "https://example.test/approve",
+            }),
+          },
+        });
+      }
+      const result = response.kind === "elicit" ? { action: response.action } : { action: "decline" };
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         structuredContent: result,
@@ -162,10 +176,14 @@ function createFixtureServer() {
     {
       title: "List Roots",
       description: "Ask the MCP client for roots.",
-      inputSchema: {},
+      inputSchema: z.object({}),
     },
-    async () => {
-      const roots = await server.server.listRoots();
+    async (_args, ctx) => {
+      const response = inputResponse(ctx.mcpReq.inputResponses, "roots");
+      if (response.kind === "missing") {
+        return inputRequired({ inputRequests: { roots: inputRequired.listRoots() } });
+      }
+      const roots = response.kind === "roots" ? { roots: response.roots } : { roots: [] };
       return {
         content: [{ type: "text", text: JSON.stringify(roots) }],
         structuredContent: roots,
@@ -178,10 +196,10 @@ function createFixtureServer() {
     {
       title: "Notify Tools Changed",
       description: "Send a tools/list_changed notification.",
-      inputSchema: {},
+      inputSchema: z.object({}),
     },
     async () => {
-      server.sendToolListChanged();
+      await server.sendToolListChanged();
       return {
         content: [{ type: "text", text: "sent tools/list_changed" }],
       };
@@ -219,9 +237,9 @@ function createFixtureServer() {
     {
       title: "Review Prompt",
       description: "Create a review prompt for a topic.",
-      argsSchema: {
-        topic: z.string().describe("Topic to review"),
-      },
+      argsSchema: z.object({
+              topic: z.string().describe("Topic to review"),
+            }),
     },
     ({ topic }) => ({
       messages: [
@@ -237,69 +255,29 @@ function createFixtureServer() {
 }
 
 async function startStdio() {
-  const server = createFixtureServer();
-  await server.connect(new StdioServerTransport());
   console.error("pi-mcp fixture server running on stdio");
+  if (process.argv.includes("--legacy")) {
+    const server = createFixtureServer();
+    await server.connect(new StdioServerTransport());
+    return;
+  }
+  await serveStdio(() => createFixtureServer());
 }
 
 async function startHttp() {
   const port = Number(process.env.PI_MCP_FIXTURE_PORT ?? readArg("--port") ?? 38765);
-  const sessions = new Map();
   const oauth = process.argv.includes("--oauth") ? createOAuthFixtureState() : undefined;
+  const mcpHandler = createMcpHandler(() => createFixtureServer());
+  const nodeMcpHandler = toNodeHandler(mcpHandler);
   const nodeServer = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     if (oauth && (await handleOAuthFixtureRoute(req, res, url, oauth))) return;
-
     if (url.pathname !== "/mcp") {
       res.writeHead(404).end("not found");
       return;
     }
-
-    try {
-      if (oauth && !authorizeMcpRequest(req, res, oauth)) return;
-
-      const sessionId = req.headers["mcp-session-id"];
-      let session = typeof sessionId === "string" ? sessions.get(sessionId) : undefined;
-      if (!session && !sessionId) {
-        const server = createFixtureServer();
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (initializedSessionId) => {
-            sessions.set(initializedSessionId, { server, transport });
-          },
-        });
-        transport.onclose = () => {
-          if (transport.sessionId) sessions.delete(transport.sessionId);
-        };
-        await server.connect(transport);
-        session = { server, transport };
-      }
-
-      if (!session) {
-        res.writeHead(400, { "content-type": "application/json" }).end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: No valid MCP session ID provided" },
-            id: null,
-          }),
-        );
-        return;
-      }
-
-      const { server, transport } = session;
-      await transport.handleRequest(req, res);
-    } catch (error) {
-      console.error("fixture HTTP error:", error);
-      if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" }).end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32603, message: "Internal server error" },
-            id: null,
-          }),
-        );
-      }
-    }
+    if (oauth && !authorizeMcpRequest(req, res, oauth)) return;
+    await nodeMcpHandler(req, res);
   });
 
   await new Promise((resolve) => nodeServer.listen(port, "127.0.0.1", resolve));
@@ -309,10 +287,7 @@ async function startHttp() {
   console.log(JSON.stringify({ url: `${origin}/mcp`, statsUrl: `${origin}/fixture/stats`, expireUrl: `${origin}/fixture/expire` }));
 
   const shutdown = () => {
-    for (const { server, transport } of sessions.values()) {
-      void transport.close();
-      void server.close();
-    }
+    void mcpHandler.close();
     nodeServer.close(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
@@ -359,6 +334,7 @@ async function handleOAuthFixtureRoute(req, res, url, oauth) {
       grant_types_supported: ["authorization_code", "refresh_token"],
       token_endpoint_auth_methods_supported: ["none"],
       code_challenge_methods_supported: ["S256"],
+      authorization_response_iss_parameter_supported: true,
     });
     return true;
   }
@@ -404,6 +380,7 @@ async function handleOAuthFixtureRoute(req, res, url, oauth) {
     redirect.searchParams.set("code", code);
     const state = url.searchParams.get("state");
     if (state) redirect.searchParams.set("state", state);
+    redirect.searchParams.set("iss", origin);
     res.writeHead(302, { location: redirect.href }).end();
     return true;
   }

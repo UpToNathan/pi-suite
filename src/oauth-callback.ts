@@ -3,165 +3,157 @@ import { OAUTH_CALLBACK_PATH, OAUTH_CALLBACK_PORT, parseRedirectUri } from "./oa
 
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
 
-interface PendingAuth {
-  resolve: (code: string) => void;
-  reject: (error: Error) => void;
-  timeout: ReturnType<typeof setTimeout>;
+/** Parsed OAuth callback parameters retained for SDK issuer validation. */
+export type OAuthCallbackResult = URLSearchParams;
+
+/** Owns one manager's OAuth callback listener and pending browser flows. */
+export interface OAuthCallbackRuntime {
+  /** Starts the loopback callback listener for the configured redirect URI. */
+  start(redirectUri?: string): Promise<void>;
+  /** Waits for a callback matching one server and state value. */
+  waitForResult(server: string, state: string): Promise<OAuthCallbackResult>;
+  /** Cancels the pending callback for one MCP server. */
+  cancel(server: string): void;
+  /** Closes the listener and rejects all pending callback waits. */
+  close(): Promise<void>;
 }
 
-let server: Server | undefined;
-let currentPort = OAUTH_CALLBACK_PORT;
-let currentPath = OAUTH_CALLBACK_PATH;
-const pendingAuths = new Map<string, PendingAuth>();
-const mcpNameToState = new Map<string, string>();
+type PendingAuth = {
+  readonly server: string;
+  readonly resolve: (result: OAuthCallbackResult) => void;
+  readonly reject: (error: Error) => void;
+  readonly timeout: ReturnType<typeof setTimeout>;
+};
 
-/** Starts the local OAuth callback server and fails if the configured port is unavailable. */
-export async function ensureCallbackServer(redirectUri?: string) {
-  const { port, path } = parseRedirectUri(redirectUri);
-  if (server && (currentPort !== port || currentPath !== path)) await stopCallbackServer();
-  if (server) return;
+/** Node loopback implementation of the manager-owned OAuth callback runtime. */
+export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
+  private server: Server | undefined;
+  private currentPort = OAUTH_CALLBACK_PORT;
+  private currentPath = OAUTH_CALLBACK_PATH;
+  private readonly pendingByState = new Map<string, PendingAuth>();
+  private readonly stateByServer = new Map<string, string>();
 
-  currentPort = port;
-  currentPath = path;
-  const nextServer = createServer(handleRequest);
-  await new Promise<void>((resolve, reject) => {
-    nextServer.once("error", (error) => {
-      reject(new Error(`OAuth callback server could not listen on 127.0.0.1:${currentPort}: ${error.message}`));
+  /** Starts the callback listener and fails when its loopback port is unavailable. */
+  async start(redirectUri?: string): Promise<void> {
+    const { port, path } = parseRedirectUri(redirectUri);
+    if (this.server && (this.currentPort !== port || this.currentPath !== path)) await this.close();
+    if (this.server) return;
+
+    this.currentPort = port;
+    this.currentPath = path;
+    const nextServer = createServer((request, response) => this.handleRequest(request, response));
+    await new Promise<void>((resolve, reject) => {
+      nextServer.once("error", (error) => {
+        reject(new Error(`OAuth callback server could not listen on 127.0.0.1:${port}: ${error.message}`));
+      });
+      nextServer.listen(port, "127.0.0.1", resolve);
     });
-    nextServer.listen(currentPort, "127.0.0.1", () => resolve());
-  });
-  server = nextServer;
-}
-
-/** Waits for a matching OAuth callback code for one state value. */
-export function waitForCallback(oauthState: string, mcpName?: string) {
-  if (mcpName) mcpNameToState.set(mcpName, oauthState);
-  return new Promise<string>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      const pending = pendingAuths.get(oauthState);
-      if (!pending) return;
-      pendingAuths.delete(oauthState);
-      if (mcpName) mcpNameToState.delete(mcpName);
-      pending.reject(new Error("OAuth callback timeout - authorization took too long"));
-      stopIfIdle();
-    }, CALLBACK_TIMEOUT_MS);
-    pendingAuths.set(oauthState, { resolve, reject, timeout });
-  });
-}
-
-/** Rejects and removes any pending OAuth callback for the named MCP server. */
-export function cancelPendingCallback(mcpName: string) {
-  const oauthState = mcpNameToState.get(mcpName);
-  const key = oauthState ?? mcpName;
-  const pending = pendingAuths.get(key);
-  if (!pending) return;
-  clearTimeout(pending.timeout);
-  pendingAuths.delete(key);
-  mcpNameToState.delete(mcpName);
-  pending.reject(new Error("Authorization cancelled"));
-  stopIfIdle();
-}
-
-/** Stops the local OAuth callback server and rejects all pending callback waits. */
-export async function stopCallbackServer() {
-  const activeServer = server;
-  if (activeServer) {
-    await new Promise<void>((resolve) => activeServer.close(() => resolve()));
-    server = undefined;
+    this.server = nextServer;
   }
 
-  for (const pending of pendingAuths.values()) {
-    clearTimeout(pending.timeout);
-    pending.reject(new Error("OAuth callback server stopped"));
-  }
-  pendingAuths.clear();
-  mcpNameToState.clear();
-}
-
-function handleRequest(req: IncomingMessage, res: ServerResponse) {
-  const url = new URL(req.url || "/", `http://127.0.0.1:${currentPort}`);
-  if (url.pathname !== currentPath) {
-    res.writeHead(404);
-    res.end("Not found");
-    return;
-  }
-
-  const code = url.searchParams.get("code");
-  const state = url.searchParams.get("state");
-  const error = url.searchParams.get("error");
-  const errorDescription = url.searchParams.get("error_description");
-
-  if (!state) {
-    sendHtml(res, 400, errorPage("Missing required state parameter"));
-    return;
+  /** Waits for callback parameters whose state belongs to the named MCP server. */
+  waitForResult(server: string, state: string): Promise<OAuthCallbackResult> {
+    this.stateByServer.set(server, state);
+    return new Promise<OAuthCallbackResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const pending = this.pendingByState.get(state);
+        if (!pending) return;
+        this.removePending(state, pending);
+        pending.reject(new Error("OAuth callback timeout - authorization took too long"));
+        this.stopIfIdle();
+      }, CALLBACK_TIMEOUT_MS);
+      this.pendingByState.set(state, { server, resolve, reject, timeout });
+    });
   }
 
-  if (error) {
-    const message = errorDescription || error;
-    const pending = pendingAuths.get(state);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      pendingAuths.delete(state);
-      cleanupStateIndex(state);
-      pending.reject(new Error(message));
+  /** Cancels one server's pending callback without affecting another manager or server. */
+  cancel(server: string): void {
+    const state = this.stateByServer.get(server);
+    if (!state) return;
+    const pending = this.pendingByState.get(state);
+    if (!pending) return;
+    this.removePending(state, pending);
+    pending.reject(new Error("Authorization cancelled"));
+    this.stopIfIdle();
+  }
+
+  /** Closes this runtime and rejects all callback waits it owns. */
+  async close(): Promise<void> {
+    const activeServer = this.server;
+    this.server = undefined;
+    if (activeServer) await new Promise<void>((resolve) => activeServer.close(() => resolve()));
+    for (const [state, pending] of this.pendingByState) {
+      this.removePending(state, pending);
+      pending.reject(new Error("OAuth callback server stopped"));
     }
-    sendHtml(res, 200, errorPage(message));
-    stopIfIdle();
-    return;
   }
 
-  if (!code) {
-    sendHtml(res, 400, errorPage("No authorization code provided"));
-    return;
-  }
-
-  const pending = pendingAuths.get(state);
-  if (!pending) {
-    sendHtml(res, 400, errorPage("Invalid or expired state parameter"));
-    return;
-  }
-
-  clearTimeout(pending.timeout);
-  pendingAuths.delete(state);
-  cleanupStateIndex(state);
-  pending.resolve(code);
-  sendHtml(res, 200, successPage());
-  stopIfIdle();
-}
-
-function cleanupStateIndex(oauthState: string) {
-  for (const [name, state] of mcpNameToState) {
-    if (state === oauthState) {
-      mcpNameToState.delete(name);
+  private handleRequest(request: IncomingMessage, response: ServerResponse): void {
+    const url = new URL(request.url || "/", `http://127.0.0.1:${this.currentPort}`);
+    if (url.pathname !== this.currentPath) {
+      response.writeHead(404).end("Not found");
       return;
     }
+
+    const state = url.searchParams.get("state");
+    if (!state) {
+      sendHtml(response, 400, errorPage("Missing required state parameter"));
+      return;
+    }
+    const pending = this.pendingByState.get(state);
+    if (!pending) {
+      sendHtml(response, 400, errorPage("Invalid or expired state parameter"));
+      return;
+    }
+    if (url.searchParams.has("error")) {
+      this.removePending(state, pending);
+      pending.reject(new Error("OAuth authorization server returned an error"));
+      sendHtml(response, 200, errorPage("The authorization server did not approve this request."));
+      this.stopIfIdle();
+      return;
+    }
+    if (!url.searchParams.has("code")) {
+      sendHtml(response, 400, errorPage("No authorization code provided"));
+      return;
+    }
+
+    this.removePending(state, pending);
+    pending.resolve(new URLSearchParams(url.searchParams));
+    sendHtml(response, 200, successPage());
+    this.stopIfIdle();
+  }
+
+  private removePending(state: string, pending: PendingAuth): void {
+    clearTimeout(pending.timeout);
+    this.pendingByState.delete(state);
+    if (this.stateByServer.get(pending.server) === state) this.stateByServer.delete(pending.server);
+  }
+
+  private stopIfIdle(): void {
+    if (this.pendingByState.size > 0 || !this.server) return;
+    this.server.close();
+    this.server = undefined;
   }
 }
 
-function stopIfIdle() {
-  if (pendingAuths.size > 0 || !server) return;
-  server.close();
-  server = undefined;
+function sendHtml(response: ServerResponse, status: number, html: string): void {
+  response.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+  response.end(html);
 }
 
-function sendHtml(res: ServerResponse, status: number, html: string) {
-  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(html);
-}
-
-function successPage() {
+function successPage(): string {
   return `<!doctype html><html><head><title>Pi MCP Authorization</title><style>${style()}</style></head><body><main><h1>Authorization Successful</h1><p>You can close this window and return to Pi.</p></main><script>setTimeout(() => window.close(), 2000)</script></body></html>`;
 }
 
-function errorPage(error: string) {
+function errorPage(error: string): string {
   return `<!doctype html><html><head><title>Pi MCP Authorization Failed</title><style>${style()}</style></head><body><main><h1>Authorization Failed</h1><p>${escapeHtml(error)}</p></main></body></html>`;
 }
 
-function style() {
+function style(): string {
   return "body{font-family:system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#101014;color:#f4f4f5}main{text-align:center;padding:2rem;max-width:36rem}h1{margin:0 0 1rem}p{color:#c4c4cc}";
 }
 
-function escapeHtml(value: string) {
+function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => {
     switch (char) {
       case "&":

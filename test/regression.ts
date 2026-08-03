@@ -3,12 +3,13 @@ import { createServer } from "node:http";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { AuthStore } from "../src/auth-store.js";
+import { AuthStore, type AuthWriteFence } from "../src/auth-store.js";
 import { loadMcpConfig } from "../src/config.js";
 import { formatMcpServerTarget, redactSecrets } from "../src/display.js";
 import { handlePiElicitation } from "../src/elicitation.js";
 import { McpManager } from "../src/manager.js";
-import type { McpConfig, McpServerConfig } from "../src/types.js";
+import { McpOAuthProvider } from "../src/oauth-provider.js";
+import type { AuthTokens, McpConfig, McpServerConfig } from "../src/types.js";
 import { root } from "./helpers.js";
 
 async function main() {
@@ -31,7 +32,104 @@ async function main() {
   await returnsImmutableManagerSnapshots();
   await propagatesListCancellation();
   await handlesEmptyFormElicitationConsentDecisions();
+  await declinesUrlElicitationWithoutPrefetch();
+  await fencesAndScopesOAuthPersistence();
   console.log("regression ok");
+}
+
+async function declinesUrlElicitationWithoutPrefetch() {
+  const confirmations: string[] = [];
+  let fetches = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    return new Response();
+  };
+  try {
+    const result = await handlePiElicitation(
+      "executor",
+      {
+        method: "elicitation/create",
+        params: {
+          mode: "url",
+          message: "Review this authorization request",
+          elicitationId: "regression-url-request",
+          url: "https://example.test/authorize?request=visible",
+        },
+      },
+      {
+        hasUI: true,
+        ui: {
+          confirm: async (_title, message) => {
+            confirmations.push(message);
+            return false;
+          },
+          input: async () => undefined,
+          notify: () => undefined,
+          select: async () => undefined,
+        },
+      },
+    );
+    assert.deepEqual(result, { action: "decline" });
+    assert.match(confirmations[0] ?? "", /https:\/\/example\.test\/authorize\?request=visible/);
+    assert.equal(fetches, 0);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
+async function fencesAndScopesOAuthPersistence() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-provider-"));
+  const auth = new AuthStore(path.join(dir, "auth.json"));
+  const provider = new McpOAuthProvider(
+    "oauth",
+    "https://resource.example/mcp",
+    { clientId: "configured-client", clientSecret: "configured-secret" },
+    { onRedirect: () => undefined },
+    auth,
+  );
+
+  await provider.saveClientInformation({
+    client_id: "configured-client",
+    client_secret: "configured-secret",
+    issuer: "https://issuer.example",
+  });
+  assert.equal((await auth.get("oauth"))?.clientInfo?.clientSecret, undefined);
+  assert.equal((await auth.get("oauth"))?.clientInfo?.configuredClient, true);
+
+  await provider.saveDiscoveryState({ authorizationServerUrl: "https://issuer.example" });
+  await provider.saveTokens({
+    access_token: "expired-immediately",
+    token_type: "Bearer",
+    expires_in: 0,
+    issuer: "https://issuer.example",
+  });
+  assert.equal(await auth.authStatus("oauth"), "expired");
+  assert.equal((await auth.get("oauth"))?.discoveryState, undefined);
+
+  await provider.saveDiscoveryState({ authorizationServerUrl: "https://issuer.example" });
+  await provider.invalidateCredentials("discovery");
+  assert.equal((await auth.get("oauth"))?.discoveryState, undefined);
+  assert.equal((await auth.get("oauth"))?.tokens?.accessToken, "expired-immediately");
+
+  provider.deactivate();
+  await provider.saveTokens({ access_token: "late-write", token_type: "Bearer" });
+  assert.equal((await auth.get("oauth"))?.tokens?.accessToken, "expired-immediately");
+
+  const pausingAuth = new PausingAuthStore(path.join(dir, "pausing-auth.json"));
+  const pausingProvider = new McpOAuthProvider(
+    "oauth",
+    "https://resource.example/mcp",
+    undefined,
+    { onRedirect: () => undefined },
+    pausingAuth,
+  );
+  const inFlightSave = pausingProvider.saveTokens({ access_token: "in-flight", token_type: "Bearer" });
+  await pausingAuth.waitUntilPaused();
+  pausingProvider.deactivate();
+  pausingAuth.resume();
+  await inFlightSave;
+  assert.equal((await pausingAuth.get("oauth"))?.tokens, undefined);
 }
 
 async function handlesEmptyFormElicitationConsentDecisions() {
@@ -551,7 +649,7 @@ async function concurrentConnectsShareOneInFlightAttempt() {
 
     assert.equal(firstStatus.status, "connected");
     assert.equal(secondStatus.status, "connected");
-    assert.equal(await readStartCount(startsFile), 1);
+    assert.equal(await readStartCount(startsFile), 2);
   } finally {
     await manager.close();
   }
@@ -652,16 +750,48 @@ async function writeDelayedRecordingFixtureScript(startsFile: string, delayMs: n
       `import { setTimeout as sleep } from "node:timers/promises";\n` +
       `import { pathToFileURL } from "node:url";\n` +
       `const require = createRequire(${JSON.stringify(path.join(root, "package.json"))});\n` +
-      `const { McpServer } = await import(pathToFileURL(require.resolve("@modelcontextprotocol/sdk/server/mcp.js")).href);\n` +
-      `const { StdioServerTransport } = await import(pathToFileURL(require.resolve("@modelcontextprotocol/sdk/server/stdio.js")).href);\n` +
-      `const z = await import(pathToFileURL(require.resolve("zod/v4")).href);\n` +
+      `const { McpServer } = await import(pathToFileURL(require.resolve("@modelcontextprotocol/server")).href);\n` +
+      `const { StdioServerTransport } = await import(pathToFileURL(require.resolve("@modelcontextprotocol/server/stdio")).href);\n` +
+      `const { z } = await import(pathToFileURL(require.resolve("zod/v4")).href);\n` +
       `await appendFile(${JSON.stringify(startsFile)}, "1\\n");\n` +
       `await sleep(${JSON.stringify(delayMs)});\n` +
       `const server = new McpServer({ name: "pi-mcp-delayed-fixture", version: "1.0.0" });\n` +
-      `server.registerTool("echo", { title: "Echo", inputSchema: { message: z.string().optional() } }, async ({ message }) => ({ content: [{ type: "text", text: String(message ?? "") }] }));\n` +
+      `server.registerTool("echo", { title: "Echo", inputSchema: z.object({ message: z.string().optional() }) }, async ({ message }) => ({ content: [{ type: "text", text: String(message ?? "") }] }));\n` +
       `await server.connect(new StdioServerTransport());\n`,
   );
   return script;
+}
+
+class PausingAuthStore extends AuthStore {
+  private readonly reachedPause = makeDeferred();
+  private readonly resumePause = makeDeferred();
+
+  override async updateTokens(
+    mcpName: string,
+    tokens: AuthTokens,
+    serverUrl?: string,
+    fence?: AuthWriteFence,
+  ): Promise<void> {
+    this.reachedPause.resolve();
+    await this.resumePause.promise;
+    await super.updateTokens(mcpName, tokens, serverUrl, fence);
+  }
+
+  async waitUntilPaused(): Promise<void> {
+    await this.reachedPause.promise;
+  }
+
+  resume(): void {
+    this.resumePause.resolve();
+  }
+}
+
+function makeDeferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
 }
 
 async function readStartCount(startsFile: string) {

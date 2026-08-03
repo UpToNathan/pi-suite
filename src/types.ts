@@ -92,6 +92,7 @@ export interface AuthTokens {
   readonly refreshToken?: string;
   readonly expiresAt?: number;
   readonly scope?: string;
+  readonly issuer?: string;
 }
 
 /** OAuth dynamic-client registration metadata stored for one MCP server. */
@@ -100,6 +101,17 @@ export interface AuthClientInfo {
   readonly clientSecret?: string;
   readonly clientIdIssuedAt?: number;
   readonly clientSecretExpiresAt?: number;
+  readonly issuer?: string;
+  readonly redirectUris?: readonly string[];
+  readonly configuredClient?: boolean;
+}
+
+/** Persisted OAuth discovery values needed to bind a callback to its authorization server. */
+export interface AuthDiscoveryState {
+  readonly authorizationServerUrl: string;
+  readonly authorizationServerMetadata?: Readonly<Record<string, unknown>>;
+  readonly resourceMetadata?: Readonly<Record<string, unknown>>;
+  readonly resourceMetadataUrl?: string;
 }
 
 /** Persisted OAuth state for one MCP server. */
@@ -108,6 +120,7 @@ export interface AuthEntry {
   readonly clientInfo?: AuthClientInfo;
   readonly codeVerifier?: string;
   readonly oauthState?: string;
+  readonly discoveryState?: AuthDiscoveryState;
   readonly serverUrl?: string;
 }
 

@@ -21,6 +21,7 @@ async function main() {
       const callback = await followAuthorizationRedirect(authorizationUrl);
       assert.equal(callback.searchParams.get("state"), await auth.getOAuthState("oauth"));
       assert.ok(callback.searchParams.get("code"), "expected authorization code");
+      assert.equal(callback.searchParams.get("iss"), new URL(fixture.url).origin);
       const response = await fetch(callback.href);
       assert.equal(response.ok, true);
       await response.body?.cancel();
@@ -59,7 +60,11 @@ async function main() {
     const firstAuthEntry = await auth.get("oauth");
     assert.equal(firstAuthEntry?.serverUrl, fixture.url);
     assert.ok(firstAuthEntry?.clientInfo?.clientId);
+    assert.equal(firstAuthEntry?.clientInfo?.issuer, new URL(fixture.url).origin);
+    assert.deepEqual(firstAuthEntry?.clientInfo?.redirectUris, [`http://127.0.0.1:${callbackPort}/mcp/oauth/callback`]);
     assert.ok(firstAuthEntry?.tokens?.accessToken);
+    assert.equal(firstAuthEntry?.tokens?.issuer, new URL(fixture.url).origin);
+    assert.equal(firstAuthEntry?.discoveryState, undefined);
     assert.ok(firstAuthEntry?.tokens?.refreshToken);
 
     const firstEcho = await callTool(manager, "oauth_echo", { message: "before-refresh" });
@@ -86,6 +91,9 @@ async function main() {
     assert.equal(statsAfterRefresh.refreshGrants, 1);
     assert.ok(statsAfterRefresh.protectedRequests >= 2);
 
+    await rejectsInvalidCallbackIssuer(fixture, tempDir, "mismatch");
+    await rejectsInvalidCallbackIssuer(fixture, tempDir, "missing");
+
     await manager.removeAuth("oauth");
     assert.equal(await manager.authStatus("oauth"), "not_authenticated");
     assert.equal((await auth.get("oauth"))?.tokens, undefined);
@@ -95,6 +103,45 @@ async function main() {
     await manager.close();
     fixture.child.kill("SIGTERM");
     await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function rejectsInvalidCallbackIssuer(
+  fixture: Awaited<ReturnType<typeof startMcpFixture>> & { statsUrl: string },
+  tempDir: string,
+  mode: "mismatch" | "missing",
+) {
+  const callbackPort = await findFreePort();
+  const auth = new AuthStore(path.join(tempDir, `invalid-issuer-${mode}.json`));
+  const before = await fixtureStats(fixture.statsUrl);
+  const manager = new McpManager({
+    cwd: root,
+    authStore: auth,
+    openAuthorizationUrl: async (authorizationUrl) => {
+      const callback = await followAuthorizationRedirect(authorizationUrl);
+      if (mode === "mismatch") callback.searchParams.set("iss", "https://attacker.invalid");
+      else callback.searchParams.delete("iss");
+      const response = await fetch(callback);
+      assert.equal(response.ok, true);
+      await response.body?.cancel();
+    },
+  });
+  try {
+    await manager.initialize(
+      {
+        timeout: 10_000,
+        servers: {
+          oauth: { type: "remote", url: fixture.url, timeout: 10_000, oauth: { callbackPort } },
+        },
+      },
+      { mode: "connect", intent: "explicit", signal: undefined },
+    );
+    const status = await manager.authenticate("oauth");
+    assert.equal(status.status, "failed");
+    assert.match(status.status === "failed" ? status.error : "", /issuer|iss/i);
+    assert.equal((await fixtureStats(fixture.statsUrl)).authorizationCodeGrants, before.authorizationCodeGrants);
+  } finally {
+    await manager.close();
   }
 }
 

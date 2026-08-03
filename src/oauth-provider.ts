@@ -1,12 +1,13 @@
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
-  OAuthClientInformation,
-  OAuthClientInformationFull,
+  OAuthClientInformationContext,
   OAuthClientMetadata,
-  OAuthTokens,
-} from "@modelcontextprotocol/sdk/shared/auth.js";
-import type { AuthClientInfo, AuthTokens, OAuthConfig } from "./types.js";
-import { AuthStore } from "./auth-store.js";
+  OAuthClientProvider,
+  OAuthDiscoveryState,
+  StoredOAuthClientInformation,
+  StoredOAuthTokens,
+} from "@modelcontextprotocol/client";
+import type { AuthClientInfo, AuthDiscoveryState, AuthTokens, OAuthConfig } from "./types.js";
+import { AuthStore, type AuthWriteFence } from "./auth-store.js";
 import { randomHex } from "./random.js";
 
 /** Default local port used by the OAuth browser callback listener. */
@@ -21,6 +22,9 @@ export interface OAuthCallbacks {
 
 /** Implements the MCP SDK OAuth persistence and redirect contract using Pi's auth store. */
 export class McpOAuthProvider implements OAuthClientProvider {
+  private active = true;
+  private readonly writeFence: AuthWriteFence;
+
   /** Creates an OAuth provider for one remote MCP server and its persisted auth state. */
   constructor(
     private mcpName: string,
@@ -28,7 +32,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
     private config: OAuthConfig | undefined,
     private callbacks: OAuthCallbacks,
     private auth: AuthStore,
-  ) {}
+  ) {
+    this.writeFence = auth.createOAuthWriteFence(mcpName);
+  }
 
   /** Redirect URI registered with the OAuth authorization server. */
   get redirectUrl(): string {
@@ -51,71 +57,97 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   /** Returns saved static or dynamically registered OAuth client information. */
-  async clientInformation(): Promise<OAuthClientInformation | undefined> {
+  async clientInformation(ctx?: OAuthClientInformationContext): Promise<StoredOAuthClientInformation | undefined> {
     if (this.config?.clientId) {
-      const info: OAuthClientInformation = {
+      const entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
+      if (ctx?.issuer && entry?.clientInfo?.configuredClient && entry.clientInfo.issuer !== ctx.issuer) return undefined;
+      if (ctx?.issuer && !entry?.clientInfo?.configuredClient && this.active) {
+        await this.auth.updateClientInfo(
+          this.mcpName,
+          { clientId: this.config.clientId, issuer: ctx.issuer, configuredClient: true },
+          this.serverUrl,
+          this.writeFence,
+        );
+      }
+      return {
         client_id: this.config.clientId,
+        ...(this.config.clientSecret !== undefined ? { client_secret: this.config.clientSecret } : {}),
+        ...(ctx?.issuer ? { issuer: ctx.issuer } : {}),
       };
-      if (this.config.clientSecret !== undefined) info.client_secret = this.config.clientSecret;
-      return info;
     }
 
     const entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
-    if (!entry?.clientInfo) return undefined;
+    if (!entry?.clientInfo || (ctx?.issuer && entry.clientInfo.issuer !== ctx.issuer)) return undefined;
     if (entry.clientInfo.clientSecretExpiresAt && entry.clientInfo.clientSecretExpiresAt < Date.now() / 1000) {
       return undefined;
     }
 
-    const info: OAuthClientInformation = {
+    return {
       client_id: entry.clientInfo.clientId,
+      ...(entry.clientInfo.clientSecret !== undefined ? { client_secret: entry.clientInfo.clientSecret } : {}),
+      ...(entry.clientInfo.clientIdIssuedAt !== undefined ? { client_id_issued_at: entry.clientInfo.clientIdIssuedAt } : {}),
+      ...(entry.clientInfo.clientSecretExpiresAt !== undefined
+        ? { client_secret_expires_at: entry.clientInfo.clientSecretExpiresAt }
+        : {}),
+      ...(entry.clientInfo.issuer ? { issuer: entry.clientInfo.issuer } : {}),
     };
-    if (entry.clientInfo.clientSecret !== undefined) info.client_secret = entry.clientInfo.clientSecret;
-    return info;
   }
 
   /** Persists dynamically registered OAuth client information. */
-  async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
+  async saveClientInformation(info: StoredOAuthClientInformation): Promise<void> {
+    if (!this.active) return;
+    const configuredClient = info.client_id === this.config?.clientId;
     const clientInfo: AuthClientInfo = {
       clientId: info.client_id,
-      ...(nonEmptyString(info.client_secret) ? { clientSecret: info.client_secret } : {}),
+      ...(!configuredClient && nonEmptyString(info.client_secret) ? { clientSecret: info.client_secret } : {}),
       ...(info.client_id_issued_at !== undefined ? { clientIdIssuedAt: info.client_id_issued_at } : {}),
       ...(info.client_secret_expires_at !== undefined ? { clientSecretExpiresAt: info.client_secret_expires_at } : {}),
+      ...(info.issuer ? { issuer: info.issuer } : {}),
+      ...(!configuredClient ? { redirectUris: [this.redirectUrl] } : {}),
+      ...(configuredClient ? { configuredClient: true } : {}),
     };
     await this.auth.updateClientInfo(
       this.mcpName,
       clientInfo,
       this.serverUrl,
+      this.writeFence,
     );
   }
 
   /** Returns saved OAuth tokens in the shape expected by the MCP SDK. */
-  async tokens(): Promise<OAuthTokens | undefined> {
+  async tokens(ctx?: OAuthClientInformationContext): Promise<StoredOAuthTokens | undefined> {
     const entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
-    if (!entry?.tokens) return undefined;
+    if (!entry?.tokens || (ctx?.issuer && entry.tokens.issuer !== ctx.issuer)) return undefined;
 
-    const tokens: OAuthTokens = {
+    const tokens: StoredOAuthTokens = {
       access_token: entry.tokens.accessToken,
       token_type: "Bearer",
     };
     if (entry.tokens.refreshToken !== undefined) tokens.refresh_token = entry.tokens.refreshToken;
     if (entry.tokens.expiresAt !== undefined) tokens.expires_in = Math.max(0, Math.floor(entry.tokens.expiresAt - Date.now() / 1000));
     if (entry.tokens.scope !== undefined) tokens.scope = entry.tokens.scope;
+    if (entry.tokens.issuer !== undefined) tokens.issuer = entry.tokens.issuer;
     return tokens;
   }
 
   /** Persists OAuth tokens returned by the MCP SDK after grant or refresh flows. */
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  async saveTokens(tokens: StoredOAuthTokens): Promise<void> {
+    if (!this.active) return;
     const authTokens: AuthTokens = {
       accessToken: tokens.access_token,
       ...(nonEmptyString(tokens.refresh_token) ? { refreshToken: tokens.refresh_token } : {}),
       ...(tokens.expires_in !== undefined ? { expiresAt: Date.now() / 1000 + tokens.expires_in } : {}),
       ...(nonEmptyString(tokens.scope) ? { scope: tokens.scope } : {}),
+      ...(nonEmptyString(tokens.issuer) ? { issuer: tokens.issuer } : {}),
     };
     await this.auth.updateTokens(
       this.mcpName,
       authTokens,
       this.serverUrl,
+      this.writeFence,
     );
+    if (!this.active) return;
+    await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
   }
 
   /** Captures or opens the authorization URL supplied by the MCP SDK. */
@@ -125,7 +157,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   /** Persists the PKCE code verifier supplied by the MCP SDK. */
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
-    await this.auth.updateCodeVerifier(this.mcpName, codeVerifier);
+    if (!this.active) return;
+    await this.auth.updateCodeVerifier(this.mcpName, codeVerifier, this.writeFence);
   }
 
   /** Returns the PKCE code verifier for the current OAuth flow. */
@@ -137,7 +170,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   /** Persists the OAuth state supplied by the MCP SDK. */
   async saveState(state: string): Promise<void> {
-    await this.auth.updateOAuthState(this.mcpName, state);
+    if (!this.active) return;
+    await this.auth.updateOAuthState(this.mcpName, state, this.writeFence);
   }
 
   /** Returns an existing OAuth state or creates one for the current OAuth flow. */
@@ -145,25 +179,71 @@ export class McpOAuthProvider implements OAuthClientProvider {
     const entry = await this.auth.get(this.mcpName);
     if (entry?.oauthState) return entry.oauthState;
     const state = randomHex();
-    await this.auth.updateOAuthState(this.mcpName, state);
+    await this.auth.updateOAuthState(this.mcpName, state, this.writeFence);
+    if (!this.active) throw new Error(`OAuth provider is inactive for MCP server: ${this.mcpName}`);
     return state;
   }
 
-  /** Removes persisted client or token credentials after the SDK invalidates them. */
-  async invalidateCredentials(type: "all" | "client" | "tokens"): Promise<void> {
-    const entry = await this.auth.get(this.mcpName);
-    if (!entry) return;
-
-    if (type === "all") {
-      await this.auth.remove(this.mcpName);
-      return;
-    }
-
-    const { clientInfo: _clientInfo, ...withoutClient } = entry;
-    const { tokens: _tokens, ...withoutTokens } = entry;
-    const next = type === "client" ? withoutClient : withoutTokens;
-    await this.auth.set(this.mcpName, next);
+  /** Persists OAuth discovery data across the browser redirect round trip. */
+  async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
+    if (!this.active) return;
+    await this.auth.updateDiscoveryState(this.mcpName, toAuthDiscoveryState(state), this.writeFence);
   }
+
+  /** Returns OAuth discovery data for the active browser round trip. */
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    const state = (await this.auth.get(this.mcpName))?.discoveryState;
+    if (!state) return undefined;
+    // SAFETY: AuthStore parsed the persisted JSON object and this provider originally received these fields from the SDK.
+    return state as OAuthDiscoveryState;
+  }
+
+  /** Prevents late SDK callbacks from mutating credentials after cancellation or shutdown. */
+  deactivate(): void {
+    this.active = false;
+    this.auth.revokeOAuthWriteFence(this.mcpName, this.writeFence);
+  }
+
+  /** Removes only the credential scope invalidated by the SDK. */
+  async invalidateCredentials(type: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+    if (!this.active) return;
+    switch (type) {
+      case "all":
+        await this.auth.remove(this.mcpName);
+        return;
+      case "client":
+        await this.auth.clearClientInfo(this.mcpName, this.writeFence);
+        return;
+      case "tokens":
+        await this.auth.clearTokens(this.mcpName, this.writeFence);
+        return;
+      case "verifier":
+        await this.auth.clearCodeVerifier(this.mcpName, this.writeFence);
+        return;
+      case "discovery":
+        await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
+    }
+  }
+}
+
+function toAuthDiscoveryState(state: OAuthDiscoveryState): AuthDiscoveryState {
+  return {
+    authorizationServerUrl: state.authorizationServerUrl,
+    ...(state.authorizationServerMetadata
+      ? { authorizationServerMetadata: cloneJsonRecord(state.authorizationServerMetadata) }
+      : {}),
+    ...(state.resourceMetadata ? { resourceMetadata: cloneJsonRecord(state.resourceMetadata) } : {}),
+    ...(state.resourceMetadataUrl ? { resourceMetadataUrl: state.resourceMetadataUrl } : {}),
+  };
+}
+
+function cloneJsonRecord(value: object): Record<string, unknown> {
+  const cloned: unknown = JSON.parse(JSON.stringify(value));
+  if (typeof cloned !== "object" || cloned === null || Array.isArray(cloned)) {
+    throw new Error("OAuth discovery metadata was not a JSON object");
+  }
+  // SAFETY: The runtime checks above establish a non-null, non-array object after JSON serialization.
+  return cloned as Record<string, unknown>;
 }
 
 function nonEmptyString(value: unknown): value is string {

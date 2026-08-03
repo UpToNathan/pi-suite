@@ -1,22 +1,8 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { Client, type ClientOptions } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
-import {
-  ElicitRequestSchema,
-  ListRootsRequestSchema,
-  LoggingMessageNotificationSchema,
-  ToolListChangedNotificationSchema,
-  type ElicitRequest,
-  type ElicitResult,
-  type LoggingMessageNotification,
-  type Prompt,
-  type Resource,
-  type Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client, StreamableHTTPClientTransport, SSEClientTransport, UnauthorizedError } from "@modelcontextprotocol/client";
+import type { ClientOptions, ElicitRequest, ElicitResult, LoggingMessageNotification, Prompt, Resource, Tool } from "@modelcontextprotocol/client";
 import open from "open";
 import type {
   AuthStatus,
@@ -39,13 +25,11 @@ import { withTimeout } from "./timeout.js";
 import { listPrompts, listResources, listTools } from "./catalog.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
 import {
-  cancelPendingCallback,
-  ensureCallbackServer,
-  stopCallbackServer,
-  waitForCallback,
+  NodeOAuthCallbackRuntime,
+  type OAuthCallbackRuntime,
 } from "./oauth-callback.js";
 
-const CLIENT_OPTIONS = {
+const MCP_CLIENT_OPTIONS = {
   capabilities: {
     elicitation: {
       form: { applyDefaults: true },
@@ -53,6 +37,8 @@ const CLIENT_OPTIONS = {
     },
     roots: {},
   },
+  versionNegotiation: { mode: "auto" as const },
+  inputRequired: { autoFulfill: true },
 } satisfies ClientOptions;
 
 type Transport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport;
@@ -108,11 +94,14 @@ interface ManagerOptions {
   onToolsChanged?: (server: string) => void | Promise<void>;
   onStatusChanged?: () => void | Promise<void>;
   openAuthorizationUrl?: (url: string) => void | Promise<void>;
+  oauthCallbackRuntime?: OAuthCallbackRuntime;
 }
 
 /** Manages configured MCP clients, dynamic Pi tool registration data, resources, prompts, and OAuth state. */
 export class McpManager {
   private auth: AuthStore;
+  private readonly oauthCallbacks: OAuthCallbackRuntime;
+  private readonly oauthProviders = new Map<string, Set<McpOAuthProvider>>();
   private clients = new Map<string, ManagedClient>();
   private statuses = new Map<string, McpStatus>();
   private config: McpConfig = { servers: {} };
@@ -125,12 +114,16 @@ export class McpManager {
   /** Creates a manager for one Pi workspace and optional auth/UI callback seams. */
   constructor(private options: ManagerOptions) {
     this.auth = options.authStore ?? new AuthStore();
+    this.oauthCallbacks = options.oauthCallbackRuntime ?? new NodeOAuthCallbackRuntime();
   }
 
   /** Replaces the active MCP configuration and runs the caller-selected startup operation. */
   async initialize(config: McpConfig, options: McpInitializeOptions): Promise<void> {
     this.closed = false;
     this.revision += 1;
+    this.deactivateOAuthProviders();
+    await this.oauthCallbacks.close();
+    await this.closePendingOAuthTransports();
     await this.closeClients();
     this.connectionAttempts.clear();
     this.statuses.clear();
@@ -369,7 +362,7 @@ export class McpManager {
   }
 
   /** Runs the OAuth flow for one remote MCP server and reconnects it after successful authorization. */
-  async authenticate(name: string, onAuthorizationUrl?: (url: string) => void | Promise<void>) {
+  async authenticate(name: string, onAuthorizationUrl?: (url: string) => void | Promise<void>): Promise<McpStatus> {
     const result = await this.startAuth(name);
     if (!result.authorizationUrl) {
       if (!result.client) return { status: "failed", error: "OAuth did not return a connected client" } satisfies McpStatus;
@@ -383,24 +376,27 @@ export class McpManager {
       return this.statuses.get(name) ?? { status: "failed", error: "OAuth did not store a connected status" };
     }
 
-    const callbackPromise = waitForCallback(result.oauthState, name);
+    const callbackPromise = this.oauthCallbacks.waitForResult(name, result.oauthState);
     await this.openAuthorizationUrl(result.authorizationUrl, onAuthorizationUrl);
 
-    const code = await callbackPromise;
+    const callbackParams = await callbackPromise;
     const storedState = await this.auth.getOAuthState(name);
-    if (storedState !== result.oauthState) {
+    if (storedState !== result.oauthState || callbackParams.get("state") !== result.oauthState) {
       await this.auth.clearOAuthState(name);
       throw new Error("OAuth state mismatch");
     }
     await this.auth.clearOAuthState(name);
-    return this.finishAuth(name, code);
+    return this.finishAuth(name, callbackParams);
   }
 
   /** Removes stored OAuth state and cancels any in-flight authorization for one MCP server. */
-  async removeAuth(name: string) {
-    await this.auth.remove(name);
-    cancelPendingCallback(name);
+  async removeAuth(name: string): Promise<void> {
+    this.deactivateOAuthProviders(name);
+    this.oauthCallbacks.cancel(name);
+    const pendingTransport = this.pendingOAuthTransports.get(name);
     this.pendingOAuthTransports.delete(name);
+    if (pendingTransport) await safeCloseTransport(pendingTransport);
+    await this.auth.remove(name);
   }
 
   /** Returns the persisted OAuth status for one MCP server. */
@@ -409,12 +405,13 @@ export class McpManager {
   }
 
   /** Closes all connected MCP clients and any local OAuth callback listener. */
-  async close() {
+  async close(): Promise<void> {
     this.closed = true;
     this.revision += 1;
+    this.deactivateOAuthProviders();
+    await this.oauthCallbacks.close();
+    await this.closePendingOAuthTransports();
     await this.closeClients();
-    await stopCallbackServer();
-    this.pendingOAuthTransports.clear();
     this.connectionAttempts.clear();
   }
 
@@ -513,7 +510,7 @@ export class McpManager {
       config: serverConfig,
       tools,
     });
-    this.watch(name, result.client, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT);
+    this.watch(name, result.client);
     await this.options.onToolsChanged?.(name);
     await this.emitStatusChanged();
     return result.status;
@@ -557,13 +554,13 @@ export class McpManager {
     const oauthDisabled = serverConfig.oauth === false;
     const authProvider = oauthDisabled
       ? undefined
-      : new McpOAuthProvider(
+      : this.trackOAuthProvider(name, new McpOAuthProvider(
           name,
           serverConfig.url,
           typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined,
           { onRedirect: async () => undefined },
           this.auth,
-        );
+        ));
 
     const transports: Array<{ name: string; transport: TransportWithAuth }> = [
       {
@@ -619,22 +616,43 @@ export class McpManager {
     options.signal?.throwIfAborted();
 
     const client = this.createClient(name);
-    await withTimeout(client.connect(asSdkTransport(transport)), timeout, "MCP connect", { signal: undefined });
+    await withTimeout(client.connect(transport), timeout, "MCP connect", { signal: undefined });
     return client;
   }
 
   private createClient(server = "unknown") {
-    const client = new Client({ name: "pi", version: "0.1.0" }, CLIENT_OPTIONS);
-    client.setRequestHandler(ListRootsRequestSchema, () =>
+    let client: Client | undefined;
+    client = new Client(
+      { name: "pi", version: "0.1.0" },
+      {
+        ...MCP_CLIENT_OPTIONS,
+        listChanged: {
+          tools: {
+            onChanged: (error) => {
+              if (error) {
+                console.error(`[mcp:${server}] tool list refresh failed: ${safeErrorSummary(error)}`);
+                return;
+              }
+              if (!client) return;
+              const refreshed = this.handleToolListChanged(server, client);
+              refreshed.catch((refreshError) => {
+                console.error(`[mcp:${server}] tool list refresh failed: ${safeErrorSummary(refreshError)}`);
+              });
+            },
+          },
+        },
+      },
+    );
+    client.setRequestHandler('roots/list', () =>
       Promise.resolve({ roots: [{ uri: pathToFileURL(this.options.cwd).href }] }),
     );
-    client.setRequestHandler(ElicitRequestSchema, (request) => {
+    client.setRequestHandler('elicitation/create', (request) => {
       return this.options.onElicitation?.(server, request) ?? { action: "decline" };
     });
     return client;
   }
 
-  private watch(name: string, client: Client, timeout: number) {
+  private watch(name: string, client: Client) {
     client.onclose = () => {
       const closed = this.handleClientClosed(name, client);
       closed.catch((error) => {
@@ -642,22 +660,17 @@ export class McpManager {
       });
     };
 
-    client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+    client.setNotificationHandler('notifications/message', (notification) => {
       logServerMessage(name, notification.params);
     });
 
     if (!client.getServerCapabilities()?.tools) return;
-    client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
-      const refreshed = this.handleToolListChanged(name, client, timeout);
-      refreshed.catch((error) => {
-        console.error(`[mcp:${name}] tool list refresh failed: ${safeErrorSummary(error)}`);
-      });
-    });
   }
 
-  private async handleToolListChanged(name: string, client: Client, timeout: number) {
+  private async handleToolListChanged(name: string, client: Client) {
     const managed = this.clients.get(name);
     if (!managed || managed.client !== client || this.statuses.get(name)?.status !== "connected") return;
+    const timeout = managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT;
     const tools = await listTools(client, timeout, undefined);
     const collision = findToolKeyCollision(new Map(this.clients).set(name, { ...managed, tools }));
     if (collision) {
@@ -680,13 +693,13 @@ export class McpManager {
     const redirectUri =
       oauthConfig?.redirectUri ??
       (oauthConfig?.callbackPort ? `http://127.0.0.1:${oauthConfig.callbackPort}/mcp/oauth/callback` : undefined);
-    await ensureCallbackServer(redirectUri);
+    await this.oauthCallbacks.start(redirectUri);
 
     const oauthState = randomHex();
     await this.auth.updateOAuthState(name, oauthState);
 
     let capturedUrl: URL | undefined;
-    const authProvider = new McpOAuthProvider(
+    const authProvider = this.trackOAuthProvider(name, new McpOAuthProvider(
       name,
       serverConfig.url,
       oauthProviderConfig(oauthConfig, redirectUri),
@@ -696,13 +709,13 @@ export class McpManager {
         },
       },
       this.auth,
-    );
+    ));
 
     const transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions(authProvider, serverConfig.headers));
 
     try {
       const client = this.createClient(name);
-      await client.connect(asSdkTransport(transport));
+      await client.connect(transport);
       return { authorizationUrl: "", oauthState, client, transport };
     } catch (error) {
       if (error instanceof UnauthorizedError && capturedUrl) {
@@ -714,15 +727,16 @@ export class McpManager {
     }
   }
 
-  private async finishAuth(name: string, authorizationCode: string) {
+  private async finishAuth(name: string, callbackParams: URLSearchParams) {
     const transport = this.pendingOAuthTransports.get(name);
     if (!transport) throw new Error(`No pending OAuth flow for MCP server: ${name}`);
 
     try {
-      await transport.finishAuth(authorizationCode);
+      await transport.finishAuth(callbackParams);
       const exchangedEntry = await this.auth.get(name);
       await this.auth.clearCodeVerifier(name);
-      this.pendingOAuthTransports.delete(name);
+      if (this.pendingOAuthTransports.get(name) === transport) this.pendingOAuthTransports.delete(name);
+      await safeCloseTransport(transport);
       const status = await this.connect(name, { intent: "explicit", signal: undefined });
       if (status.status === "needs_auth" && exchangedEntry?.tokens) {
         return {
@@ -732,7 +746,25 @@ export class McpManager {
       }
       return status;
     } catch (error) {
+      if (this.pendingOAuthTransports.get(name) === transport) this.pendingOAuthTransports.delete(name);
+      await safeCloseTransport(transport);
       return { status: "failed", error: errorMessage(error) } satisfies McpStatus;
+    }
+  }
+
+  private trackOAuthProvider(server: string, provider: McpOAuthProvider): McpOAuthProvider {
+    const providers = this.oauthProviders.get(server) ?? new Set<McpOAuthProvider>();
+    providers.add(provider);
+    this.oauthProviders.set(server, providers);
+    return provider;
+  }
+
+  private deactivateOAuthProviders(server?: string): void {
+    const entries = server ? [[server, this.oauthProviders.get(server)] as const] : Array.from(this.oauthProviders);
+    for (const [name, providers] of entries) {
+      if (!providers) continue;
+      for (const provider of providers) provider.deactivate();
+      this.oauthProviders.delete(name);
     }
   }
 
@@ -755,7 +787,7 @@ export class McpManager {
     }
     this.statuses.set(name, { status: "connected" });
     this.clients.set(name, { client, transport, config, tools });
-    this.watch(name, client, config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT);
+    this.watch(name, client);
     await this.options.onToolsChanged?.(name);
     await this.emitStatusChanged();
   }
@@ -774,6 +806,12 @@ export class McpManager {
     this.clients.delete(name);
     this.statuses.set(name, status);
     if (managed) await safeCloseClient(managed.client, managed.transport);
+  }
+
+  private async closePendingOAuthTransports(): Promise<void> {
+    const transports = Array.from(this.pendingOAuthTransports.values());
+    this.pendingOAuthTransports.clear();
+    await Promise.all(transports.map((transport) => safeCloseTransport(transport)));
   }
 
   private async closeClients() {
@@ -1004,12 +1042,6 @@ async function collectPartial<T>(
 
 function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError";
-}
-
-function asSdkTransport(transport: Transport): Parameters<Client["connect"]>[0] {
-  // SAFETY: The MCP SDK transport classes implement the SDK Transport interface at runtime; exact optional
-  // property checking makes their declaration files structurally incompatible with that interface.
-  return transport as Parameters<Client["connect"]>[0];
 }
 
 async function safeCloseClient(client: Client, transport: Transport) {

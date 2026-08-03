@@ -8,6 +8,7 @@ async function main() {
   const httpFixture = await startMcpFixture();
   const toolsChanged: string[] = [];
   const elicitations: string[] = [];
+  const urlRequests: string[] = [];
 
   const manager = new McpManager({
     cwd: root,
@@ -16,6 +17,10 @@ async function main() {
     },
     onElicitation: (server, request) => {
       elicitations.push(`${server}:${request.params.message}`);
+      if (request.params.mode === "url") {
+        urlRequests.push(request.params.url);
+        return { action: "accept" };
+      }
       return {
         action: "accept",
         content: {
@@ -37,6 +42,11 @@ async function main() {
           command: [process.execPath, "test/local-mcp-server.mjs"],
           timeout: 10_000,
         },
+        legacy: {
+          type: "local",
+          command: [process.execPath, "test/local-mcp-server.mjs", "--legacy"],
+          timeout: 10_000,
+        },
         remote: {
           type: "remote",
           url: httpFixture.url,
@@ -53,6 +63,11 @@ async function main() {
     });
     assert.equal(manager.status().local?.status, "connected");
     assert.equal(manager.status().remote?.status, "connected");
+    assert.equal(manager.status().legacy?.status, "connected");
+    const clients = manager.connectedClients();
+    assert.equal(clients.get("local")?.client.getProtocolEra(), "modern");
+    assert.equal(clients.get("remote")?.client.getProtocolEra(), "modern");
+    assert.equal(clients.get("legacy")?.client.getProtocolEra(), "legacy");
 
     const toolKeys = new Set(manager.getToolEntries().map((entry) => entry.key));
     for (const key of [
@@ -62,6 +77,7 @@ async function main() {
       "local_resource_content",
       "local_fail",
       "local_elicit_form",
+      "local_elicit_url",
       "local_list_roots",
       "local_notify_tools_changed",
       "remote_echo",
@@ -102,6 +118,16 @@ async function main() {
       content: { name: "remote-user", count: 7, confirm: true, color: "green" },
     });
 
+    const urlElicitation = await callTool(manager, "local_elicit_url", {});
+    assert.deepEqual(urlElicitation.details.structuredContent, { action: "accept" });
+    assert.deepEqual(urlRequests, ["https://example.test/approve"]);
+
+    const legacyElicitation = await callTool(manager, "legacy_elicit_form", {});
+    assert.deepEqual(legacyElicitation.details.structuredContent, {
+      action: "accept",
+      content: { name: "legacy-user", count: 7, confirm: true, color: "green" },
+    });
+
     const resourceResult = await manager.resources(undefined, { signal: undefined });
     assert.deepEqual(resourceResult.failures, []);
     assert.equal(resourceResult.resources.some((resource) => resource.client === "local" && resource.uri === "test://text"), true);
@@ -123,11 +149,15 @@ async function main() {
     const prompt = await manager.getPrompt("local", "review", { topic: "MCP" }, { signal: undefined });
     assert.match(JSON.stringify(prompt.messages), /Review MCP from the fixture prompt/);
 
+    assert.equal(clients.get("local")?.client.getServerCapabilities()?.tools?.listChanged, true);
+    const localChangeCount = toolsChanged.filter((server) => server === "local").length;
     await callTool(manager, "local_notify_tools_changed", {});
-    await sleep(200);
-    assert.equal(toolsChanged.includes("local"), true);
+    await sleep(500);
+    assert.ok(toolsChanged.filter((server) => server === "local").length > localChangeCount);
     assert.equal(elicitations.includes("local:Fixture form request"), true);
     assert.equal(elicitations.includes("remote:Fixture form request"), true);
+    assert.equal(elicitations.includes("legacy:Fixture form request"), true);
+    assert.equal(elicitations.includes("local:Fixture URL request"), true);
 
     console.log("smoke ok");
   } finally {

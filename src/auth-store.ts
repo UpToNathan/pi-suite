@@ -2,18 +2,38 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { AuthClientInfo, AuthEntry, AuthStatus, AuthTokens } from "./types.js";
+import type { AuthClientInfo, AuthDiscoveryState, AuthEntry, AuthStatus, AuthTokens } from "./types.js";
 
 type AuthData = Record<string, AuthEntry>;
+
+const AUTH_WRITE_FENCE = Symbol("AuthWriteFence");
+
+/** Opaque ownership token that prevents superseded OAuth providers from mutating auth state. */
+export interface AuthWriteFence {
+  readonly [AUTH_WRITE_FENCE]: symbol;
+}
 
 /** Persists OAuth client metadata, tokens, and in-flight PKCE state for MCP servers. */
 export class AuthStore {
   private filepath: string;
   private queue = Promise.resolve();
+  private readonly activeWriteFences = new Map<string, AuthWriteFence>();
 
   /** Creates an auth store backed by the default Pi MCP auth file or a test-supplied path. */
   constructor(filepath = path.join(homedir(), ".pi", "agent", "mcp-auth.json")) {
     this.filepath = filepath;
+  }
+
+  /** Claims auth-write ownership for the newest OAuth provider of one MCP server. */
+  createOAuthWriteFence(mcpName: string): AuthWriteFence {
+    const fence: AuthWriteFence = { [AUTH_WRITE_FENCE]: Symbol(mcpName) };
+    this.activeWriteFences.set(mcpName, fence);
+    return fence;
+  }
+
+  /** Revokes auth-write ownership when the matching OAuth provider stops. */
+  revokeOAuthWriteFence(mcpName: string, fence: AuthWriteFence): void {
+    if (this.activeWriteFences.get(mcpName) === fence) this.activeWriteFences.delete(mcpName);
   }
 
   /** Reads every valid persisted auth entry keyed by configured MCP server name. */
@@ -52,28 +72,48 @@ export class AuthStore {
   }
 
   /** Stores OAuth tokens for one MCP server. */
-  updateTokens(mcpName: string, tokens: AuthTokens, serverUrl?: string) {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, tokens, ...(serverUrl ? { serverUrl } : {}) }));
+  updateTokens(mcpName: string, tokens: AuthTokens, serverUrl?: string, fence?: AuthWriteFence): Promise<void> {
+    return this.updateEntry(mcpName, (entry) => ({ ...entry, tokens, ...(serverUrl ? { serverUrl } : {}) }), fence);
   }
 
   /** Stores OAuth client registration metadata for one MCP server. */
-  updateClientInfo(mcpName: string, clientInfo: AuthClientInfo, serverUrl?: string) {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, clientInfo, ...(serverUrl ? { serverUrl } : {}) }));
+  updateClientInfo(mcpName: string, clientInfo: AuthClientInfo, serverUrl?: string, fence?: AuthWriteFence): Promise<void> {
+    return this.updateEntry(mcpName, (entry) => ({ ...entry, clientInfo, ...(serverUrl ? { serverUrl } : {}) }), fence);
+  }
+
+  /** Stores OAuth discovery state for an in-flight browser round trip. */
+  updateDiscoveryState(mcpName: string, discoveryState: AuthDiscoveryState, fence?: AuthWriteFence): Promise<void> {
+    return this.updateEntry(mcpName, (entry) => ({ ...entry, discoveryState }), fence);
+  }
+
+  /** Removes OAuth discovery state without clearing unrelated credentials. */
+  clearDiscoveryState(mcpName: string, fence?: AuthWriteFence): Promise<void> {
+    return this.clearField(mcpName, "discoveryState", fence);
+  }
+
+  /** Removes stored OAuth tokens without clearing client registration or flow state. */
+  clearTokens(mcpName: string, fence?: AuthWriteFence): Promise<void> {
+    return this.clearField(mcpName, "tokens", fence);
+  }
+
+  /** Removes stored OAuth client registration without clearing tokens or flow state. */
+  clearClientInfo(mcpName: string, fence?: AuthWriteFence): Promise<void> {
+    return this.clearField(mcpName, "clientInfo", fence);
   }
 
   /** Stores a PKCE code verifier for an in-flight OAuth flow. */
-  updateCodeVerifier(mcpName: string, codeVerifier: string) {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, codeVerifier }));
+  updateCodeVerifier(mcpName: string, codeVerifier: string, fence?: AuthWriteFence): Promise<void> {
+    return this.updateEntry(mcpName, (entry) => ({ ...entry, codeVerifier }), fence);
   }
 
   /** Removes the PKCE code verifier after OAuth completion or cancellation. */
-  clearCodeVerifier(mcpName: string) {
-    return this.clearField(mcpName, "codeVerifier");
+  clearCodeVerifier(mcpName: string, fence?: AuthWriteFence): Promise<void> {
+    return this.clearField(mcpName, "codeVerifier", fence);
   }
 
   /** Stores the OAuth state value for an in-flight OAuth flow. */
-  updateOAuthState(mcpName: string, oauthState: string) {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, oauthState }));
+  updateOAuthState(mcpName: string, oauthState: string, fence?: AuthWriteFence): Promise<void> {
+    return this.updateEntry(mcpName, (entry) => ({ ...entry, oauthState }), fence);
   }
 
   /** Reads the OAuth state value for an in-flight OAuth flow, if present. */
@@ -82,8 +122,8 @@ export class AuthStore {
   }
 
   /** Removes the OAuth state value after OAuth completion or cancellation. */
-  clearOAuthState(mcpName: string) {
-    return this.clearField(mcpName, "oauthState");
+  clearOAuthState(mcpName: string, fence?: AuthWriteFence): Promise<void> {
+    return this.clearField(mcpName, "oauthState", fence);
   }
 
   /** Classifies the stored token state for one MCP server. */
@@ -94,14 +134,20 @@ export class AuthStore {
     return entry.tokens.expiresAt < Date.now() / 1000 ? "expired" : "authenticated";
   }
 
-  private async updateEntry(mcpName: string, update: (entry: AuthEntry) => AuthEntry) {
+  private async updateEntry(
+    mcpName: string,
+    update: (entry: AuthEntry) => AuthEntry,
+    fence?: AuthWriteFence,
+  ): Promise<void> {
     await this.mutate((data) => {
+      if (fence && this.activeWriteFences.get(mcpName) !== fence) return data;
       return { ...data, [mcpName]: update(data[mcpName] ?? {}) };
     });
   }
 
-  private async clearField(mcpName: string, field: keyof AuthEntry) {
+  private async clearField(mcpName: string, field: keyof AuthEntry, fence?: AuthWriteFence): Promise<void> {
     await this.mutate((data) => {
+      if (fence && this.activeWriteFences.get(mcpName) !== fence) return data;
       const entry = data[mcpName];
       if (!entry) return data;
       return { ...data, [mcpName]: clearAuthEntryField(entry, field) };
@@ -176,6 +222,10 @@ function clearAuthEntryField(entry: AuthEntry, field: keyof AuthEntry): AuthEntr
       const { oauthState: _oauthState, ...next } = entry;
       return next;
     }
+    case "discoveryState": {
+      const { discoveryState: _discoveryState, ...next } = entry;
+      return next;
+    }
     case "serverUrl": {
       const { serverUrl: _serverUrl, ...next } = entry;
       return next;
@@ -194,6 +244,8 @@ function parseAuthEntry(value: unknown): AuthEntry | undefined {
   if ("codeVerifier" in value && codeVerifier === undefined) return undefined;
   const oauthState = optionalString(value.oauthState);
   if ("oauthState" in value && oauthState === undefined) return undefined;
+  const discoveryState = parseAuthDiscoveryState(value.discoveryState);
+  if ("discoveryState" in value && discoveryState === undefined) return undefined;
   const serverUrl = optionalString(value.serverUrl);
   if ("serverUrl" in value && serverUrl === undefined) return undefined;
 
@@ -202,6 +254,7 @@ function parseAuthEntry(value: unknown): AuthEntry | undefined {
     ...(clientInfo !== undefined ? { clientInfo } : {}),
     ...(codeVerifier !== undefined ? { codeVerifier } : {}),
     ...(oauthState !== undefined ? { oauthState } : {}),
+    ...(discoveryState !== undefined ? { discoveryState } : {}),
     ...(serverUrl !== undefined ? { serverUrl } : {}),
   };
 }
@@ -215,12 +268,15 @@ function parseAuthTokens(value: unknown): AuthTokens | undefined {
   if ("expiresAt" in value && expiresAt === undefined) return undefined;
   const scope = optionalString(value.scope);
   if ("scope" in value && scope === undefined) return undefined;
+  const issuer = optionalString(value.issuer);
+  if ("issuer" in value && issuer === undefined) return undefined;
 
   return {
     accessToken: value.accessToken,
     ...(refreshToken !== undefined ? { refreshToken } : {}),
     ...(expiresAt !== undefined ? { expiresAt } : {}),
     ...(scope !== undefined ? { scope } : {}),
+    ...(issuer !== undefined ? { issuer } : {}),
   };
 }
 
@@ -233,12 +289,38 @@ function parseAuthClientInfo(value: unknown): AuthClientInfo | undefined {
   if ("clientIdIssuedAt" in value && clientIdIssuedAt === undefined) return undefined;
   const clientSecretExpiresAt = optionalNumber(value.clientSecretExpiresAt);
   if ("clientSecretExpiresAt" in value && clientSecretExpiresAt === undefined) return undefined;
+  const issuer = optionalString(value.issuer);
+  if ("issuer" in value && issuer === undefined) return undefined;
+  const redirectUris = optionalStringArray(value.redirectUris);
+  if ("redirectUris" in value && redirectUris === undefined) return undefined;
+  const configuredClient = optionalBoolean(value.configuredClient);
+  if ("configuredClient" in value && configuredClient === undefined) return undefined;
 
   return {
     clientId: value.clientId,
     ...(clientSecret !== undefined ? { clientSecret } : {}),
     ...(clientIdIssuedAt !== undefined ? { clientIdIssuedAt } : {}),
     ...(clientSecretExpiresAt !== undefined ? { clientSecretExpiresAt } : {}),
+    ...(issuer !== undefined ? { issuer } : {}),
+    ...(redirectUris !== undefined ? { redirectUris } : {}),
+    ...(configuredClient !== undefined ? { configuredClient } : {}),
+  };
+}
+
+function parseAuthDiscoveryState(value: unknown): AuthDiscoveryState | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainRecord(value) || typeof value.authorizationServerUrl !== "string") return undefined;
+  const authorizationServerMetadata = optionalJsonRecord(value.authorizationServerMetadata);
+  if ("authorizationServerMetadata" in value && authorizationServerMetadata === undefined) return undefined;
+  const resourceMetadata = optionalJsonRecord(value.resourceMetadata);
+  if ("resourceMetadata" in value && resourceMetadata === undefined) return undefined;
+  const resourceMetadataUrl = optionalString(value.resourceMetadataUrl);
+  if ("resourceMetadataUrl" in value && resourceMetadataUrl === undefined) return undefined;
+  return {
+    authorizationServerUrl: value.authorizationServerUrl,
+    ...(authorizationServerMetadata ? { authorizationServerMetadata } : {}),
+    ...(resourceMetadata ? { resourceMetadata } : {}),
+    ...(resourceMetadataUrl ? { resourceMetadataUrl } : {}),
   };
 }
 
@@ -248,6 +330,25 @@ function optionalString(value: unknown) {
 
 function optionalNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function optionalStringArray(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.every((item) => typeof item === "string") ? [...value] : undefined;
+}
+
+function optionalJsonRecord(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainRecord(value)) return undefined;
+  try {
+    const cloned: unknown = JSON.parse(JSON.stringify(value));
+    return isPlainRecord(cloned) ? cloned : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

@@ -1,0 +1,13 @@
+client:
+  # Local Pi extensions cannot host a stable public HTTPS Client ID Metadata Document.
+  - auth/basic-cimd
+  # Pi's interactive flow does not yet resume an in-flight tool call after a widened-scope challenge.
+  - auth/scope-step-up
+  # Final-v2 issuer validation rejects the referee's intentionally mismatched 2025 metadata.
+  - auth/2025-03-26-oauth-metadata-backcompat
+  # Client-credentials grants are not part of Pi's interactive authorization-code flow.
+  - auth/client-credentials-basic
+  # Private-key JWT client authentication is outside this extension's configured OAuth flows.
+  - auth/client-credentials-jwt
+  # SEP-990 cross-app token exchange and JWT bearer grants are outside the supported OAuth flows.
+  - auth/cross-app-access-complete-flow

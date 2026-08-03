@@ -2,6 +2,10 @@
 
 Pi extension that ports OpenCode-style MCP client support to Pi.
 
+## Requirements
+
+Pi-MCP requires Node.js 20 or newer. It negotiates the stateless MCP 2026-07-28 protocol when available and automatically falls back to compatible 2025-era servers.
+
 ## Install
 
 From GitHub:
@@ -126,7 +130,7 @@ The extension also registers `list_mcp_resources` and `read_mcp_resource` in dir
 
 ## Elicitation
 
-The MCP client advertises form and URL elicitation support. In TUI/RPC modes, form fields are mapped to Pi UI dialogs:
+The MCP client advertises form and URL elicitation support. Modern servers use 2026 multi-round-trip `input_required` results; legacy server-initiated elicitation remains supported through the same handlers. In TUI/RPC modes, form fields are mapped to Pi UI dialogs:
 
 - string enums use `ctx.ui.select`
 - booleans use `ctx.ui.confirm`
@@ -156,7 +160,7 @@ It can also run as a local Streamable HTTP server with OAuth:
 node test/local-mcp-server.mjs --http --oauth
 ```
 
-The smoke suite starts both stdio and local Streamable HTTP fixture transports and exercises tools, structured content, resources, prompts, roots, list-change notifications, and elicitation:
+The smoke suite starts modern stdio and stateless Streamable HTTP fixtures plus a legacy-only fallback fixture. It exercises tools, structured content, resources, prompts, roots, subscriptions/listen list changes, and multi-round-trip elicitation:
 
 ```bash
 npm run smoke
@@ -167,3 +171,13 @@ OAuth and token refresh are covered separately:
 ```bash
 npm run smoke:oauth
 ```
+
+Roots, logging notifications, Dynamic Client Registration, and HTTP+SSE fallback are retained only for compatibility; the 2026 protocol deprecates them.
+
+Official client conformance runs through the real manager, auth store, and callback runtime:
+
+```bash
+npm run test:conformance
+```
+
+Reviewed expected gaps are documented in `conformance/README.md` and the fail-closed baseline.

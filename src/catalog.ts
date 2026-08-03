@@ -1,13 +1,6 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import {
-  CallToolResultSchema,
-  ListToolsResultSchema,
-  ToolSchema,
-  type CallToolResult,
-  type Prompt,
-  type Resource,
-  type Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/core";
+import { Client } from "@modelcontextprotocol/client";
+import type { CallToolResult, Prompt, Resource, Tool } from "@modelcontextprotocol/client";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import {
@@ -19,10 +12,6 @@ import {
 import { base64Size, formatBytes } from "./resource-size.js";
 import { normalizeToolSchema } from "./tool-schema.js";
 import type { CancellableOptions } from "./types.js";
-
-const TolerantListToolsResultSchema = ListToolsResultSchema.extend({
-  tools: ToolSchema.omit({ outputSchema: true }).array(),
-});
 
 /**
  * Collects every page from an MCP list endpoint while rejecting cursor loops.
@@ -50,18 +39,10 @@ export async function paginate<T, R extends { nextCursor?: string | undefined }>
   throw new Error(`MCP list exceeded ${MAX_LIST_PAGES} pages`);
 }
 
-/** Lists tools from an MCP client, with a compatibility path for unsupported output-schema references. */
+/** Lists tools from an MCP client while rejecting cursor loops. */
 export async function listTools(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Tool[]> {
   return paginate(
-    async (cursor) => {
-      const params = cursor === undefined ? undefined : { cursor };
-      try {
-        return await client.listTools(params, requestOptions(timeout, signal));
-      } catch (error) {
-        if (!(error instanceof Error) || !isOutputSchemaValidationError(error)) throw error;
-        return client.request({ method: "tools/list", params }, TolerantListToolsResultSchema, requestOptions(timeout, signal));
-      }
-    },
+    (cursor) => client.listTools(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
     (result) => result.tools,
   );
 }
@@ -102,8 +83,10 @@ export async function callMcpTool(input: {
       name: input.tool.name,
       arguments: input.args,
     },
-    CallToolResultSchema,
-    requestOptions(input.timeout, input.signal),
+    {
+      ...requestOptions(input.timeout, input.signal),
+      toolDefinition: input.tool,
+    },
   );
   const result = normalizeCallToolResult(rawResult);
 
@@ -239,12 +222,6 @@ function normalizeCallToolResult(value: Awaited<ReturnType<Client["callTool"]>>)
   const parsed = CallToolResultSchema.safeParse(value);
   if (parsed.success) return parsed.data;
   return { content: [{ type: "text", text: "MCP tool returned no content." }] };
-}
-
-function isOutputSchemaValidationError(error: Error) {
-  return /can't resolve reference|resolves to more than one schema|outputSchema|schema.*reference|reference.*schema/i.test(
-    error.message,
-  );
 }
 
 function requestOptions(timeout: number | undefined, signal: CancellableOptions["signal"]) {

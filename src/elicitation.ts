@@ -1,4 +1,5 @@
-import { ElicitResultSchema, type ElicitRequest, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
+import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
+import { ElicitResultSchema } from "@modelcontextprotocol/core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import open from "open";
 
