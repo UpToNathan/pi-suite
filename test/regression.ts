@@ -21,6 +21,7 @@ async function main() {
   await rejectsMalformedAuthStoreData();
   await acceptsEmptyOptionalAuthStrings();
   await rejectsUnavailableOAuthCallbackPort();
+  await releasesOAuthCallbackPortWhenAuthenticationFails();
   await handlesClientCloseCallbackRejections();
   await rejectsDynamicToolKeyCollisions();
   await configuresWithoutConnecting();
@@ -383,6 +384,35 @@ async function rejectsUnavailableOAuthCallbackPort() {
   }
 }
 
+async function releasesOAuthCallbackPortWhenAuthenticationFails() {
+  const callbackProbe = await listenOnFreePort();
+  const callbackPort = callbackProbe.port;
+  await callbackProbe.close();
+
+  const manager = new McpManager({ cwd: root });
+  await manager.initialize(
+    {
+      servers: {
+        oauth: {
+          type: "remote",
+          url: "http://127.0.0.1:1/mcp",
+          oauth: { callbackPort },
+          timeout: 100,
+        },
+      },
+    },
+    { mode: "configure-only" },
+  );
+
+  try {
+    await assert.rejects(() => manager.authenticate("oauth"));
+    const releasedPort = await listenOnPort(callbackPort);
+    await releasedPort.close();
+  } finally {
+    await manager.close();
+  }
+}
+
 async function handlesClientCloseCallbackRejections() {
   const unhandled: string[] = [];
   const loggedErrors: string[] = [];
@@ -729,10 +759,14 @@ async function propagatesListCancellation() {
 }
 
 async function listenOnFreePort() {
+  return listenOnPort(0);
+}
+
+async function listenOnPort(port: number) {
   const server = createServer((_req, res) => {
     res.end("occupied");
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
   const address = server.address();
   assert.ok(typeof address === "object" && address, "expected local server address");
   return {

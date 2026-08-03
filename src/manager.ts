@@ -365,6 +365,8 @@ export class McpManager {
   async authenticate(name: string, onAuthorizationUrl?: (url: string) => void | Promise<void>): Promise<McpStatus> {
     const result = await this.startAuth(name);
     if (!result.authorizationUrl) {
+      this.oauthCallbacks.cancel(name);
+      await result.callbackPromise.catch(() => undefined);
       if (!result.client) return { status: "failed", error: "OAuth did not return a connected client" } satisfies McpStatus;
       const serverConfig = this.requireRemote(name);
       const tools = result.client.getServerCapabilities()?.tools
@@ -376,10 +378,9 @@ export class McpManager {
       return this.statuses.get(name) ?? { status: "failed", error: "OAuth did not store a connected status" };
     }
 
-    const callbackPromise = this.oauthCallbacks.waitForResult(name, result.oauthState);
     await this.openAuthorizationUrl(result.authorizationUrl, onAuthorizationUrl);
 
-    const callbackParams = await callbackPromise;
+    const callbackParams = await result.callbackPromise;
     const storedState = await this.auth.getOAuthState(name);
     if (storedState !== result.oauthState || callbackParams.get("state") !== result.oauthState) {
       await this.auth.clearOAuthState(name);
@@ -693,36 +694,39 @@ export class McpManager {
     const redirectUri =
       oauthConfig?.redirectUri ??
       (oauthConfig?.callbackPort ? `http://127.0.0.1:${oauthConfig.callbackPort}/mcp/oauth/callback` : undefined);
-    await this.oauthCallbacks.start(redirectUri);
-
     const oauthState = randomHex();
-    await this.auth.updateOAuthState(name, oauthState);
+    await this.oauthCallbacks.start(redirectUri);
+    const callbackPromise = this.oauthCallbacks.waitForResult(name, oauthState);
+    void callbackPromise.catch(() => undefined);
 
     let capturedUrl: URL | undefined;
-    const authProvider = this.trackOAuthProvider(name, new McpOAuthProvider(
-      name,
-      serverConfig.url,
-      oauthProviderConfig(oauthConfig, redirectUri),
-      {
-        onRedirect: async (url) => {
-          capturedUrl = url;
-        },
-      },
-      this.auth,
-    ));
-
-    const transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions(authProvider, serverConfig.headers));
-
+    let transport: TransportWithAuth | undefined;
     try {
+      await this.auth.updateOAuthState(name, oauthState);
+      const authProvider = this.trackOAuthProvider(name, new McpOAuthProvider(
+        name,
+        serverConfig.url,
+        oauthProviderConfig(oauthConfig, redirectUri),
+        {
+          onRedirect: async (url) => {
+            capturedUrl = url;
+          },
+        },
+        this.auth,
+      ));
+
+      transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions(authProvider, serverConfig.headers));
       const client = this.createClient(name);
       await client.connect(transport);
-      return { authorizationUrl: "", oauthState, client, transport };
+      return { authorizationUrl: "", oauthState, callbackPromise, client, transport };
     } catch (error) {
-      if (error instanceof UnauthorizedError && capturedUrl) {
+      if (error instanceof UnauthorizedError && capturedUrl && transport) {
         this.pendingOAuthTransports.set(name, transport);
-        return { authorizationUrl: capturedUrl.toString(), oauthState };
+        return { authorizationUrl: capturedUrl.toString(), oauthState, callbackPromise };
       }
-      await safeCloseTransport(transport);
+      if (transport) await safeCloseTransport(transport);
+      this.oauthCallbacks.cancel(name);
+      await callbackPromise.catch(() => undefined);
       throw error;
     }
   }
