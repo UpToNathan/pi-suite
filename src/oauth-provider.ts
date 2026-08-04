@@ -7,8 +7,10 @@ import type {
   StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
 import type { AuthClientInfo, AuthDiscoveryState, AuthTokens, OAuthConfig } from "./types.js";
-import { AuthStore, type AuthWriteFence } from "./auth-store.js";
+import { AuthStore, type AuthRefreshLock, type AuthWriteFence } from "./auth-store.js";
 import { randomHex } from "./random.js";
+
+const MAX_REFRESH_LOCK_HOLD_MILLISECONDS = 120_000;
 
 /** Default local port used by the OAuth browser callback listener. */
 export const OAUTH_CALLBACK_PORT = 19876;
@@ -24,6 +26,9 @@ export interface OAuthCallbacks {
 export class McpOAuthProvider implements OAuthClientProvider {
   private active = true;
   private readonly writeFence: AuthWriteFence;
+  private refreshLock: AuthRefreshLock | undefined;
+  private refreshLockAcquisition: Promise<AuthRefreshLock> | undefined;
+  private refreshLockTimeout: NodeJS.Timeout | undefined;
 
   /** Creates an OAuth provider for one remote MCP server and its persisted auth state. */
   constructor(
@@ -116,8 +121,17 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   /** Returns saved OAuth tokens in the shape expected by the MCP SDK. */
   async tokens(ctx?: OAuthClientInformationContext): Promise<StoredOAuthTokens | undefined> {
-    const entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
+    let entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
     if (!entry?.tokens || (ctx?.issuer && entry.tokens.issuer !== ctx.issuer)) return undefined;
+
+    if (ctx?.issuer && entry.tokens.refreshToken) {
+      await this.acquireRefreshLock();
+      entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
+      if (!entry?.tokens || entry.tokens.issuer !== ctx.issuer) {
+        await this.releaseRefreshLock();
+        return undefined;
+      }
+    }
 
     const tokens: StoredOAuthTokens = {
       access_token: entry.tokens.accessToken,
@@ -131,27 +145,35 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   /** Persists OAuth tokens returned by the MCP SDK after grant or refresh flows. */
-  async saveTokens(tokens: StoredOAuthTokens): Promise<void> {
+  async saveTokens(tokens: StoredOAuthTokens, ctx?: OAuthClientInformationContext): Promise<void> {
     if (!this.active) return;
-    const authTokens: AuthTokens = {
-      accessToken: tokens.access_token,
-      ...(nonEmptyString(tokens.refresh_token) ? { refreshToken: tokens.refresh_token } : {}),
-      ...(tokens.expires_in !== undefined ? { expiresAt: Date.now() / 1000 + tokens.expires_in } : {}),
-      ...(nonEmptyString(tokens.scope) ? { scope: tokens.scope } : {}),
-      ...(nonEmptyString(tokens.issuer) ? { issuer: tokens.issuer } : {}),
-    };
-    await this.auth.updateTokens(
-      this.mcpName,
-      authTokens,
-      this.serverUrl,
-      this.writeFence,
-    );
-    if (!this.active) return;
-    await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
+    let retainRefreshLock = false;
+    try {
+      const existing = await this.auth.getForUrl(this.mcpName, this.serverUrl);
+      const authTokens: AuthTokens = {
+        accessToken: tokens.access_token,
+        ...(nonEmptyString(tokens.refresh_token) ? { refreshToken: tokens.refresh_token } : {}),
+        ...(tokens.expires_in !== undefined ? { expiresAt: Date.now() / 1000 + tokens.expires_in } : {}),
+        ...(nonEmptyString(tokens.scope) ? { scope: tokens.scope } : {}),
+        ...(nonEmptyString(tokens.issuer) ? { issuer: tokens.issuer } : {}),
+      };
+      await this.auth.updateTokens(
+        this.mcpName,
+        authTokens,
+        this.serverUrl,
+        this.writeFence,
+      );
+      if (!this.active) return;
+      await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
+      retainRefreshLock = isIssuerBackstamp(existing?.tokens, authTokens, ctx);
+    } finally {
+      if (!retainRefreshLock) await this.releaseRefreshLock();
+    }
   }
 
   /** Captures or opens the authorization URL supplied by the MCP SDK. */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    await this.releaseRefreshLock();
     await this.callbacks.onRedirect(authorizationUrl);
   }
 
@@ -202,27 +224,66 @@ export class McpOAuthProvider implements OAuthClientProvider {
   deactivate(): void {
     this.active = false;
     this.auth.revokeOAuthWriteFence(this.mcpName, this.writeFence);
+    void this.releaseRefreshLock().catch((error: unknown) => {
+      warnRefreshLockRelease(this.mcpName, error);
+    });
   }
 
   /** Removes only the credential scope invalidated by the SDK. */
   async invalidateCredentials(type: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
     if (!this.active) return;
-    switch (type) {
-      case "all":
-        await this.auth.remove(this.mcpName);
-        return;
-      case "client":
-        await this.auth.clearClientInfo(this.mcpName, this.writeFence);
-        return;
-      case "tokens":
-        await this.auth.clearTokens(this.mcpName, this.writeFence);
-        return;
-      case "verifier":
-        await this.auth.clearCodeVerifier(this.mcpName, this.writeFence);
-        return;
-      case "discovery":
-        await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
+    try {
+      switch (type) {
+        case "all":
+          await this.auth.remove(this.mcpName);
+          return;
+        case "client":
+          await this.auth.clearClientInfo(this.mcpName, this.writeFence);
+          return;
+        case "tokens":
+          await this.auth.clearTokens(this.mcpName, this.writeFence);
+          return;
+        case "verifier":
+          await this.auth.clearCodeVerifier(this.mcpName, this.writeFence);
+          return;
+        case "discovery":
+          await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
+      }
+    } finally {
+      await this.releaseRefreshLock();
     }
+  }
+
+  private async acquireRefreshLock(): Promise<void> {
+    if (this.refreshLock) return;
+    const acquisition = this.refreshLockAcquisition ?? this.auth.acquireOAuthRefreshLock(this.mcpName);
+    this.refreshLockAcquisition = acquisition;
+    try {
+      const refreshLock = await acquisition;
+      if (!this.active) {
+        await refreshLock.release();
+        throw new Error(`OAuth provider is inactive for MCP server: ${this.mcpName}`);
+      }
+      this.refreshLock = refreshLock;
+      if (!this.refreshLockTimeout) {
+        this.refreshLockTimeout = setTimeout(() => {
+          void this.releaseRefreshLock().catch((error: unknown) => {
+            warnRefreshLockRelease(this.mcpName, error);
+          });
+        }, MAX_REFRESH_LOCK_HOLD_MILLISECONDS);
+        this.refreshLockTimeout.unref();
+      }
+    } finally {
+      if (this.refreshLockAcquisition === acquisition) this.refreshLockAcquisition = undefined;
+    }
+  }
+
+  private async releaseRefreshLock(): Promise<void> {
+    if (this.refreshLockTimeout) clearTimeout(this.refreshLockTimeout);
+    this.refreshLockTimeout = undefined;
+    const refreshLock = this.refreshLock;
+    this.refreshLock = undefined;
+    if (refreshLock) await refreshLock.release();
   }
 }
 
@@ -244,6 +305,25 @@ function cloneJsonRecord(value: object): Record<string, unknown> {
   }
   // SAFETY: The runtime checks above establish a non-null, non-array object after JSON serialization.
   return cloned as Record<string, unknown>;
+}
+
+function isIssuerBackstamp(
+  existing: AuthTokens | undefined,
+  incoming: AuthTokens,
+  ctx: OAuthClientInformationContext | undefined,
+): boolean {
+  return (
+    existing?.issuer === undefined &&
+    existing?.accessToken === incoming.accessToken &&
+    existing.refreshToken === incoming.refreshToken &&
+    ctx?.issuer !== undefined &&
+    incoming.issuer === ctx.issuer
+  );
+}
+
+function warnRefreshLockRelease(mcpName: string, error: unknown): void {
+  const summary = error instanceof Error ? `${error.name}: ${error.message}` : `thrown ${typeof error}`;
+  console.warn(`[mcp-auth] refresh lock release failed for ${mcpName}: ${summary}`);
 }
 
 function nonEmptyString(value: unknown): value is string {

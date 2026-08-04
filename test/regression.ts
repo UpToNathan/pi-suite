@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AuthStore, type AuthWriteFence } from "../src/auth-store.js";
@@ -20,6 +22,9 @@ async function main() {
   redactsDisplayTargets();
   await rejectsMalformedAuthStoreData();
   await acceptsEmptyOptionalAuthStrings();
+  await preservesConcurrentAuthStoreUpdatesAcrossProcesses();
+  await recoversStaleAuthStoreLock();
+  await serializesRefreshTokenRotationAcrossProviders();
   await rejectsUnavailableOAuthCallbackPort();
   await releasesOAuthCallbackPortWhenAuthenticationFails();
   await handlesClientCloseCallbackRejections();
@@ -101,21 +106,30 @@ async function fencesAndScopesOAuthPersistence() {
   await provider.saveDiscoveryState({ authorizationServerUrl: "https://issuer.example" });
   await provider.saveTokens({
     access_token: "expired-immediately",
+    refresh_token: "rotating-refresh-token",
     token_type: "Bearer",
     expires_in: 0,
     issuer: "https://issuer.example",
   });
   assert.equal(await auth.authStatus("oauth"), "expired");
+
+  await provider.saveTokens({
+    access_token: "refreshed-without-rotation",
+    token_type: "Bearer",
+    expires_in: 3600,
+    issuer: "https://issuer.example",
+  });
+  assert.equal((await auth.get("oauth"))?.tokens?.refreshToken, "rotating-refresh-token");
   assert.equal((await auth.get("oauth"))?.discoveryState, undefined);
 
   await provider.saveDiscoveryState({ authorizationServerUrl: "https://issuer.example" });
   await provider.invalidateCredentials("discovery");
   assert.equal((await auth.get("oauth"))?.discoveryState, undefined);
-  assert.equal((await auth.get("oauth"))?.tokens?.accessToken, "expired-immediately");
+  assert.equal((await auth.get("oauth"))?.tokens?.accessToken, "refreshed-without-rotation");
 
   provider.deactivate();
   await provider.saveTokens({ access_token: "late-write", token_type: "Bearer" });
-  assert.equal((await auth.get("oauth"))?.tokens?.accessToken, "expired-immediately");
+  assert.equal((await auth.get("oauth"))?.tokens?.accessToken, "refreshed-without-rotation");
 
   const pausingAuth = new PausingAuthStore(path.join(dir, "pausing-auth.json"));
   const pausingProvider = new McpOAuthProvider(
@@ -327,6 +341,118 @@ async function acceptsEmptyOptionalAuthStrings() {
   assert.equal(entry?.codeVerifier, "");
   assert.equal(entry?.oauthState, "");
   assert.equal(await store.authStatus("oauth"), "authenticated");
+}
+
+async function preservesConcurrentAuthStoreUpdatesAcrossProcesses() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-auth-concurrency-"));
+  const file = path.join(dir, "auth.json");
+  const initial = Object.fromEntries(
+    Array.from({ length: 2_000 }, (_, index) => [
+      `seed-${index}`,
+      { tokens: { accessToken: `seed-access-${index}-${"x".repeat(512)}` } },
+    ]),
+  );
+  await writeFile(file, JSON.stringify(initial), { mode: 0o600 });
+
+  const workerPath = path.join(root, "test", "auth-store-worker.ts");
+  const startFile = path.join(dir, "start");
+  const workers = Array.from({ length: 12 }, (_, index) => {
+    const readyFile = path.join(dir, `ready-${index}`);
+    const child = spawn(process.execPath, ["--import", "tsx", workerPath, file, `worker-${index}`, readyFile, startFile], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { child, readyFile };
+  });
+
+  await waitForFiles(workers.map((worker) => worker.readyFile));
+  await writeFile(startFile, "start\n", { mode: 0o600 });
+  const exits = await Promise.all(workers.map(({ child }) => once(child, "exit")));
+  for (const [code, signal] of exits) assert.equal(code, 0, `auth worker failed: signal=${String(signal)}`);
+
+  const auth = new AuthStore(file);
+  const data = await auth.all();
+  for (let index = 0; index < workers.length; index++) {
+    assert.equal(data[`worker-${index}`]?.tokens?.accessToken, `access-worker-${index}`);
+  }
+  assert.equal((await stat(file)).mode & 0o777, 0o600);
+}
+
+async function recoversStaleAuthStoreLock() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-auth-stale-lock-"));
+  const file = path.join(dir, "auth.json");
+  const lockDirectory = `${file}.lock`;
+  await mkdir(lockDirectory, { mode: 0o700 });
+  const staleTime = new Date(Date.now() - 60_000);
+  await utimes(lockDirectory, staleTime, staleTime);
+
+  const auth = new AuthStore(file);
+  await auth.updateTokens("oauth", { accessToken: "recovered-after-stale-lock" });
+
+  assert.equal((await auth.get("oauth"))?.tokens?.accessToken, "recovered-after-stale-lock");
+  await assert.rejects(() => access(lockDirectory), { code: "ENOENT" });
+}
+
+async function serializesRefreshTokenRotationAcrossProviders() {
+  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-refresh-concurrency-"));
+  const file = path.join(dir, "auth.json");
+  const issuer = "https://issuer.example";
+  const serverUrl = "https://resource.example/mcp";
+  const firstAuth = new AuthStore(file);
+  await firstAuth.updateTokens(
+    "oauth",
+    { accessToken: "expired-access", refreshToken: "initial-refresh", issuer },
+    serverUrl,
+  );
+  const firstProvider = new McpOAuthProvider(
+    "oauth",
+    serverUrl,
+    undefined,
+    { onRedirect: () => undefined },
+    firstAuth,
+  );
+  const secondProvider = new McpOAuthProvider(
+    "oauth",
+    serverUrl,
+    undefined,
+    { onRedirect: () => undefined },
+    new AuthStore(file),
+  );
+
+  const firstTokens = await firstProvider.tokens({ issuer });
+  assert.equal(firstTokens?.refresh_token, "initial-refresh");
+  let secondSettled = false;
+  const secondTokensPromise = secondProvider.tokens({ issuer }).then((tokens) => {
+    secondSettled = true;
+    return tokens;
+  });
+  await sleep(75);
+  assert.equal(secondSettled, false);
+
+  await firstProvider.saveTokens(
+    { access_token: "first-refreshed-access", refresh_token: "rotated-refresh", token_type: "Bearer", issuer },
+    { issuer },
+  );
+  const secondTokens = await secondTokensPromise;
+  assert.equal(secondTokens?.refresh_token, "rotated-refresh");
+  await secondProvider.saveTokens(
+    { access_token: "second-refreshed-access", token_type: "Bearer", issuer },
+    { issuer },
+  );
+  assert.equal((await firstAuth.get("oauth"))?.tokens?.refreshToken, "rotated-refresh");
+
+  firstProvider.deactivate();
+  secondProvider.deactivate();
+}
+
+async function waitForFiles(files: readonly string[]): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const present = await Promise.all(files.map((file) => access(file).then(() => true, () => false)));
+    if (present.every(Boolean)) return;
+    await sleep(10);
+  }
+  throw new Error("Auth store workers did not reach the concurrency barrier");
 }
 
 function redactsDisplayTargets() {

@@ -1,16 +1,35 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { lock } from "proper-lockfile";
 import type { AuthClientInfo, AuthDiscoveryState, AuthEntry, AuthStatus, AuthTokens } from "./types.js";
 
 type AuthData = Record<string, AuthEntry>;
 
 const AUTH_WRITE_FENCE = Symbol("AuthWriteFence");
+const AUTH_REFRESH_LOCK = Symbol("AuthRefreshLock");
+const AUTH_LOCK_STALE_MILLISECONDS = 30_000;
+const AUTH_LOCK_UPDATE_MILLISECONDS = 5_000;
+const AUTH_LOCK_RETRY_OPTIONS = {
+  retries: 100,
+  factor: 1.15,
+  minTimeout: 20,
+  maxTimeout: 250,
+  randomize: true,
+} as const;
 
 /** Opaque ownership token that prevents superseded OAuth providers from mutating auth state. */
 export interface AuthWriteFence {
   readonly [AUTH_WRITE_FENCE]: symbol;
+}
+
+/** Cross-process lease that serializes refresh-token rotation for one MCP server. */
+export interface AuthRefreshLock {
+  readonly [AUTH_REFRESH_LOCK]: symbol;
+  /** Releases the refresh-token rotation lease; repeated calls are safe. */
+  release(): Promise<void>;
 }
 
 /** Persists OAuth client metadata, tokens, and in-flight PKCE state for MCP servers. */
@@ -71,9 +90,36 @@ export class AuthStore {
     });
   }
 
-  /** Stores OAuth tokens for one MCP server. */
+  /** Stores OAuth tokens while retaining a rotating refresh token when a response omits its replacement. */
   updateTokens(mcpName: string, tokens: AuthTokens, serverUrl?: string, fence?: AuthWriteFence): Promise<void> {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, tokens, ...(serverUrl ? { serverUrl } : {}) }), fence);
+    return this.updateEntry(
+      mcpName,
+      (entry) => ({
+        ...entry,
+        tokens:
+          tokens.refreshToken === undefined && entry.tokens?.refreshToken !== undefined
+            ? { ...tokens, refreshToken: entry.tokens.refreshToken }
+            : tokens,
+        ...(serverUrl ? { serverUrl } : {}),
+      }),
+      fence,
+    );
+  }
+
+  /** Acquires the cross-process refresh-token rotation lock for one MCP server. */
+  async acquireOAuthRefreshLock(mcpName: string): Promise<AuthRefreshLock> {
+    const digest = createHash("sha256").update(mcpName).digest("hex");
+    const target = `${this.filepath}.refresh-${digest}`;
+    const release = await acquireInterprocessLock(target);
+    let released = false;
+    return {
+      [AUTH_REFRESH_LOCK]: Symbol(mcpName),
+      async release(): Promise<void> {
+        if (released) return;
+        released = true;
+        await release();
+      },
+    };
   }
 
   /** Stores OAuth client registration metadata for one MCP server. */
@@ -154,9 +200,11 @@ export class AuthStore {
     });
   }
 
-  private mutate(update: (data: AuthData) => AuthData) {
+  private mutate(update: (data: AuthData) => AuthData): Promise<void> {
     return this.withLock(async () => {
-      await this.write(update(await this.read()));
+      await withInterprocessLock(this.filepath, async () => {
+        await this.write(update(await this.read()));
+      });
     });
   }
 
@@ -184,11 +232,44 @@ export class AuthStore {
     }
   }
 
-  private async write(data: AuthData) {
+  private async write(data: AuthData): Promise<void> {
     await mkdir(path.dirname(this.filepath), { recursive: true });
-    const tmp = `${this.filepath}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
-    await rename(tmp, this.filepath);
+    const tmp = `${this.filepath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+      await rename(tmp, this.filepath);
+      await chmod(this.filepath, 0o600);
+    } finally {
+      await unlink(tmp).catch((error: unknown) => {
+        if (!isFileNotFoundError(error)) throw error;
+      });
+    }
+  }
+}
+
+async function withInterprocessLock<T>(target: string, operation: () => Promise<T>): Promise<T> {
+  const release = await acquireInterprocessLock(target);
+  try {
+    return await operation();
+  } finally {
+    await release();
+  }
+}
+
+async function acquireInterprocessLock(target: string): Promise<() => Promise<void>> {
+  await mkdir(path.dirname(target), { recursive: true });
+  const release = await lock(target, {
+    realpath: false,
+    stale: AUTH_LOCK_STALE_MILLISECONDS,
+    update: AUTH_LOCK_UPDATE_MILLISECONDS,
+    retries: AUTH_LOCK_RETRY_OPTIONS,
+  });
+  try {
+    await chmod(`${target}.lock`, 0o700);
+    return release;
+  } catch (error) {
+    await release();
+    throw error;
   }
 }
 
@@ -353,6 +434,10 @@ function optionalJsonRecord(value: unknown): Record<string, unknown> | undefined
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && Reflect.get(error, "code") === "ENOENT";
 }
 
 function warnAuthStore(message: string) {
