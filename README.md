@@ -71,9 +71,9 @@ Also supported:
 `startup` controls connection timing:
 
 In direct tool mode, `startup: "lazy"` means MCP tools are not registered at
-startup. Run `/mcp-connect <server>` or `/mcp-reload` to connect servers and
-register direct tools. Use `startup: "eager"` if you want direct MCP tools to
-appear automatically without blocking Pi startup.
+startup. Open `/mcp`, select a server, and press `c` to connect it, or press `r`
+to reload the configuration and connect enabled servers. Use `startup: "eager"`
+if you want direct MCP tools to appear automatically without blocking Pi startup.
 
 In proxy tool mode, the `mcp` gateway registers immediately. With
 `startup: "lazy"`, it connects enabled servers on demand.
@@ -83,16 +83,23 @@ Eager connects run in parallel and do not block Pi's `session_start` handler.
 
 `${ENV_VAR}` placeholders in `environment`, `headers`, `url`, and `cwd` are expanded from the process environment.
 
-## Commands
+## Command
 
-- `/mcp-list` shows configured servers and connection status.
-- `/mcp-reload` reloads config and reconnects servers.
-- `/mcp-connect <name>` connects or reconnects a configured server.
-- `/mcp-disconnect <name>` disables a server for the current runtime.
-- `/mcp-auth [name]` starts OAuth for a remote server.
-- `/mcp-logout <name>` removes stored OAuth credentials.
-- `/mcp-prompts` lists MCP prompts from connected servers.
-- `/mcp-prompt <server> <prompt> [json args]` fetches an MCP prompt and sends it as a user message.
+`/mcp` opens a keyboard-driven server manager inspired by Pi's worktree manager.
+It shows connection, OAuth, tool, prompt, resource, target, and configuration
+details without adding a separate slash command for every operation.
+
+- `↑`/`↓` selects a server.
+- `enter` or `c` connects or reconnects it.
+- `d` disconnects it for the current runtime.
+- `a` starts OAuth when available.
+- `l` confirms and removes stored OAuth credentials.
+- `p` selects and sends one of the server's prompts.
+- `r` reloads configuration and reconnects enabled servers.
+- `esc` closes the manager.
+
+Outside TUI mode, `/mcp` reports the current server statuses without opening the
+interactive manager.
 
 In direct tool mode, connected MCP tools are registered as Pi tools using OpenCode's sanitized name convention:
 

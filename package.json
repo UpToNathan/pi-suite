@@ -20,8 +20,9 @@
     "regression": "tsx test/regression.ts",
     "smoke": "tsx test/smoke.ts",
     "smoke:oauth": "tsx test/oauth-smoke.ts",
+    "test:unit": "node --import tsx --test \"test/**/*.test.ts\"",
     "test:conformance": "bash conformance/run.sh",
-    "test": "npm run check && npm run smoke && npm run smoke:oauth && npm run regression && npm run test:conformance"
+    "test": "npm run check && npm run test:unit && npm run smoke && npm run smoke:oauth && npm run regression && npm run test:conformance"
   },
   "pi": {
     "extensions": [

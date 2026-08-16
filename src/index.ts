@@ -9,6 +9,7 @@ import { loadMcpConfig } from "./config.js";
 import { formatMcpServerTarget, redactSecrets } from "./display.js";
 import { handlePiElicitation } from "./elicitation.js";
 import { McpManager, type McpToolEntry } from "./manager.js";
+import { runMcpCommand } from "./mcp-command.js";
 import type { CancellableOptions, McpConfig, McpStatus } from "./types.js";
 import { optionalString, requiredString } from "./tool-args.js";
 
@@ -566,156 +567,31 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     registeredToolNames = new Set();
   });
 
-  pi.registerCommand("mcp-list", {
-    description: "List MCP servers and status",
+  pi.registerCommand("mcp", {
+    description: "Open the interactive MCP server manager",
     handler: async (_args, ctx) => {
-      await ensureManager(ctx);
-      showCommandMessage(pi, "MCP Servers", await statusText(requireManager(), config));
-    },
-  });
-
-  pi.registerCommand("mcp-reload", {
-    description: "Reload MCP config and reconnect servers",
-    handler: async (_args, ctx) => {
-      const loaded = await loadConfigured(ctx);
-      await loaded.activeManager.connectAll({
-        intent: "explicit",
-        signal: undefined,
+      await runMcpCommand(ctx, {
+        ensureManager: async (commandContext) => ensureManager(commandContext),
+        getConfig: () => config,
+        reload: async (commandContext) => {
+          const loaded = await loadConfigured(commandContext);
+          await loaded.activeManager.connectAll({
+            intent: "explicit",
+            signal: undefined,
+          });
+          registerDynamicTools();
+          updateMcpStatus(commandContext);
+        },
+        refreshRuntime: (commandContext) => {
+          registerDynamicTools();
+          updateMcpStatus(commandContext);
+        },
+        showStatus: (text) => showCommandMessage(pi, "MCP Servers", text),
+        showAuthorizationUrl: (url) => showCommandMessage(pi, "Open MCP OAuth URL", url),
+        sendUserMessage: (text) => pi.sendUserMessage(text),
       });
-      registerDynamicTools();
-      updateMcpStatus(ctx);
-      showCommandMessage(pi, "MCP Reloaded", await statusText(requireManager(), config));
     },
   });
-
-  pi.registerCommand("mcp-connect", {
-    description: "Connect an MCP server: /mcp-connect <name>",
-    getArgumentCompletions: (prefix) => completionItems(Object.keys(config.servers), prefix),
-    handler: async (args, ctx) => {
-      const name = args.trim();
-      if (!name) {
-        ctx.ui.notify("Usage: /mcp-connect <name>", "warning");
-        return;
-      }
-      await ensureManager(ctx);
-      const status = await requireManager().connect(name, {
-        intent: "explicit",
-        signal: undefined,
-      });
-      registerDynamicTools();
-      updateMcpStatus(ctx);
-      showCommandMessage(pi, `MCP Connect: ${name}`, formatStatus(name, config.servers[name], status));
-    },
-  });
-
-  pi.registerCommand("mcp-disconnect", {
-    description: "Disconnect an MCP server: /mcp-disconnect <name>",
-    getArgumentCompletions: (prefix) => completionItems(Object.keys(config.servers), prefix),
-    handler: async (args, ctx) => {
-      const name = args.trim();
-      if (!name) {
-        ctx.ui.notify("Usage: /mcp-disconnect <name>", "warning");
-        return;
-      }
-      await ensureManager(ctx);
-      await requireManager().disconnect(name);
-      registerDynamicTools();
-      updateMcpStatus(ctx);
-      showCommandMessage(pi, `MCP Disconnect: ${name}`, `Disconnected ${name}`);
-    },
-  });
-
-  pi.registerCommand("mcp-auth", {
-    description: "Authenticate with an OAuth-enabled remote MCP server",
-    getArgumentCompletions: (prefix) => completionItems(oauthServerNames(), prefix),
-    handler: async (args, ctx) => {
-      await ensureManager(ctx);
-      let name = args.trim();
-      if (!name) {
-        const options = oauthServerNames();
-        if (options.length === 0) {
-          ctx.ui.notify("No OAuth-capable MCP servers configured", "warning");
-          return;
-        }
-        name = (ctx.hasUI ? await ctx.ui.select("MCP OAuth server", options) : options[0]) ?? "";
-      }
-      if (!name) return;
-      const status = await requireManager().authenticate(name, async (url) => {
-        showCommandMessage(pi, "Open MCP OAuth URL", url);
-      });
-      registerDynamicTools();
-      updateMcpStatus(ctx);
-      showCommandMessage(pi, `MCP Auth: ${name}`, formatStatus(name, config.servers[name], status));
-    },
-  });
-
-  pi.registerCommand("mcp-logout", {
-    description: "Remove OAuth credentials for an MCP server: /mcp-logout <name>",
-    getArgumentCompletions: (prefix) => completionItems(Object.keys(config.servers), prefix),
-    handler: async (args, ctx) => {
-      const name = args.trim();
-      if (!name) {
-        ctx.ui.notify("Usage: /mcp-logout <name>", "warning");
-        return;
-      }
-      await ensureManager(ctx);
-      await requireManager().removeAuth(name);
-      showCommandMessage(pi, `MCP Logout: ${name}`, `Removed OAuth credentials for ${name}`);
-    },
-  });
-
-  pi.registerCommand("mcp-prompts", {
-    description: "List prompts exposed by connected MCP servers",
-    handler: async (_args, ctx) => {
-      await ensureManager(ctx);
-      const result = await requireManager().prompts({ signal: undefined });
-      const prompts = result.prompts;
-      const text =
-        prompts.length === 0
-          ? "No MCP prompts available."
-          : prompts
-              .map((prompt) => {
-                const args = prompt.arguments?.map((argument) => argument.name).join(", ");
-                return `- ${prompt.client}/${prompt.name}${args ? ` (${args})` : ""}${prompt.description ? `: ${prompt.description}` : ""}`;
-              })
-              .join("\n");
-      const failures = result.failures.map((failure) => `- ${failure.server}: ${failure.error}`).join("\n");
-      const output = failures ? `${text}\n\nPrompt servers with errors:\n${failures}` : text;
-      showCommandMessage(pi, "MCP Prompts", output);
-    },
-  });
-
-  pi.registerCommand("mcp-prompt", {
-    description: "Fetch an MCP prompt and send it as a user message: /mcp-prompt <server> <prompt> [json args]",
-    handler: async (args, ctx) => {
-      await ensureManager(ctx);
-      const parsed = parsePromptCommand(args);
-      if (!parsed) {
-        ctx.ui.notify("Usage: /mcp-prompt <server> <prompt> [json args]", "warning");
-        return;
-      }
-      const prompt = await requireManager().getPrompt(parsed.server, parsed.prompt, parsed.args, { signal: undefined });
-      const text =
-        prompt.messages
-          ?.map((message) => {
-            const content = message.content;
-            return typeof content === "object" && content && "type" in content && content.type === "text" ? content.text : "";
-          })
-          .filter((text) => text.length > 0)
-          .join("\n") ?? "";
-      if (!text.trim()) {
-        ctx.ui.notify("MCP prompt returned no text content", "warning");
-        return;
-      }
-      pi.sendUserMessage(text);
-    },
-  });
-
-  function oauthServerNames() {
-    return Object.entries(config.servers)
-      .filter(([, server]) => server.type === "remote" && server.oauth !== false)
-      .map(([name]) => name);
-  }
 
   function requireManager() {
     if (!manager) throw new Error("MCP manager has not been initialized");
@@ -781,45 +657,13 @@ function parseReadResourceArgs(value: unknown) {
   return { server: requiredString(args, "server"), uri: requiredString(args, "uri") };
 }
 
-function parsePromptCommand(input: string) {
-  const [server, prompt, ...rest] = input.trim().split(/\s+/);
-  if (!server || !prompt) return undefined;
-  const json = rest.join(" ").trim();
-  if (!json) return { server, prompt };
-  const parsed = JSON.parse(json);
-  if (!isPlainRecord(parsed)) throw new Error("Prompt args must be a JSON object");
-  return { server, prompt, args: Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, String(value)])) };
-}
-
-function completionItems(values: string[], prefix: string) {
-  const items = values
-    .filter((value) => value.startsWith(prefix))
-    .map((value) => ({ value, label: value }));
-  return items.length > 0 ? items : null;
-}
-
-async function statusText(manager: McpManager, config: McpConfig) {
-  const statuses = manager.status();
-  const lines: string[] = [];
-  if (config.source) lines.push(`Config: ${config.source}`, "");
-  const servers = Object.entries(config.servers);
-  if (servers.length === 0) return "No MCP servers configured.";
-  for (const [name, serverConfig] of servers) {
-    lines.push(formatStatus(name, serverConfig, statuses[name] ?? { status: "disabled" }));
-    if (serverConfig.type === "remote" && serverConfig.oauth !== false) {
-      lines.push(`  auth: ${await manager.authStatus(name)}`);
-    }
-  }
-  return lines.join("\n");
-}
-
 function formatStatus(name: string, serverConfig: McpConfig["servers"][string] | undefined, status: McpStatus) {
   const target = formatMcpServerTarget(serverConfig);
   const detail =
     status.status === "failed" || status.status === "needs_client_registration"
       ? `\n  ${status.error}`
       : status.status === "needs_auth"
-        ? "\n  Run /mcp-auth to authenticate."
+        ? "\n  Open /mcp and press a to authenticate."
         : "";
   return `${name}: ${status.status}${target ? `\n  ${target}` : ""}${detail}`;
 }
