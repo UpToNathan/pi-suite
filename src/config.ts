@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { Effect } from "effect";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import type { McpConfig, McpServerConfig, McpStartupMode, McpToolMode, OAuthConfig } from "./types.js";
 import { expandEnv, resolveHome } from "./config-values.js";
@@ -12,20 +13,34 @@ interface LoadOptions {
 
 type ServerEntryMode = "strict" | "discover";
 
-/** Loads and merges OpenCode-compatible MCP configurations for a Pi session. */
-export async function loadMcpConfig(options: LoadOptions): Promise<McpConfig> {
-  const envConfig = process.env.PI_MCP_CONFIG;
-  if (envConfig) {
-    const expanded = resolveHome(expandEnv(envConfig, "PI_MCP_CONFIG"));
-    if (existsSync(expanded)) return parseConfig(await readFile(expanded, "utf8"), expanded);
-    return parseConfig(envConfig, "PI_MCP_CONFIG");
-  }
+/** Effect-native MCP configuration loader. */
+export function loadMcpConfigEffect(options: LoadOptions) {
+  return Effect.gen(function* () {
+    const envConfig = process.env.PI_MCP_CONFIG;
+    if (envConfig) {
+      const expanded = resolveHome(expandEnv(envConfig, "PI_MCP_CONFIG"));
+      if (existsSync(expanded)) return parseConfig(yield* readConfig(expanded), expanded);
+      return parseConfig(envConfig, "PI_MCP_CONFIG");
+    }
 
-  const configs: McpConfig[] = [];
-  for (const file of candidateConfigFiles(options.cwd)) {
-    if (existsSync(file)) configs.push(parseConfig(await readFile(file, "utf8"), file));
-  }
-  return mergeConfigs(configs.reverse());
+    const configs: McpConfig[] = [];
+    for (const file of candidateConfigFiles(options.cwd)) {
+      if (existsSync(file)) configs.push(parseConfig(yield* readConfig(file), file));
+    }
+    return mergeConfigs(configs.reverse());
+  });
+}
+
+/** Promise boundary retained for Pi's extension API. */
+export function loadMcpConfig(options: LoadOptions): Promise<McpConfig> {
+  return Effect.runPromise(loadMcpConfigEffect(options));
+}
+
+function readConfig(file: string) {
+  return Effect.tryPromise({
+    try: () => readFile(file, "utf8"),
+    catch: (error) => error,
+  });
 }
 
 function mergeConfigs(configs: McpConfig[]): McpConfig {

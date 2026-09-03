@@ -1,6 +1,6 @@
-# pi-mcp
+# pi-suite
 
-Pi extension that ports OpenCode-style MCP client support to Pi.
+Effect-native Pi suite, starting with OpenCode-style MCP client support.
 
 ## Requirements
 
@@ -11,7 +11,7 @@ Pi-MCP requires Node.js 20 or newer. It negotiates the stateless MCP 2026-07-28 
 From GitHub:
 
 ```bash
-pi install git:github.com/dmmulroy/pi-mcp
+pi install git:github.com/UpToNathan/pi-mcp
 ```
 
 For a temporary run:

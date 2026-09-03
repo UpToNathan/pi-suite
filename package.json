@@ -1,12 +1,12 @@
 {
-  "name": "pi-mcp",
+  "name": "pi-suite",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=20"
   },
-  "description": "Pi extension that ports OpenCode-style MCP server support.",
+  "description": "Effect-native Pi suite, starting with OpenCode-style MCP support.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -32,6 +32,7 @@
   "dependencies": {
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/core": "2.0.0",
+    "effect": "^4.0.0-beta.98",
     "jsonc-parser": "^3.3.1",
     "open": "^10.2.0",
     "proper-lockfile": "^4.1.2"
