@@ -824,7 +824,7 @@ export class McpManager {
     const transports = Array.from(this.pendingOAuthTransports.values());
     this.pendingOAuthTransports.clear();
     await Effect.runPromise(
-      Effect.forEach(transports, (transport) => Effect.tryPromise({ try: () => safeCloseTransport(transport), catch: () => undefined }), {
+      Effect.forEach(transports, (transport) => safeCloseTransportEffect(transport), {
         concurrency: "unbounded",
         discard: true,
       }),
@@ -837,7 +837,7 @@ export class McpManager {
     await Effect.runPromise(
       Effect.forEach(
         clients,
-        (managed) => Effect.tryPromise({ try: () => safeCloseClient(managed.client, managed.transport), catch: () => undefined }),
+        (managed) => safeCloseClientEffect(managed.client, managed.transport),
         { concurrency: "unbounded", discard: true },
       ),
     );
@@ -1065,18 +1065,23 @@ function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError";
 }
 
-async function safeCloseClient(client: Client, transport: Transport) {
-  try {
-    await client.close();
-  } catch {
-    await safeCloseTransport(transport);
-  }
+async function safeCloseClient(client: Client, transport: Transport): Promise<void> {
+  return Effect.runPromise(safeCloseClientEffect(client, transport));
 }
 
-async function safeCloseTransport(transport: Transport) {
-  try {
-    await transport.close();
-  } catch {}
+function safeCloseClientEffect(client: Client, transport: Transport) {
+  return Effect.tryPromise({ try: () => client.close(), catch: (error) => error }).pipe(
+    Effect.catch(() => safeCloseTransportEffect(transport)),
+    Effect.asVoid,
+  );
+}
+
+function safeCloseTransport(transport: Transport): Promise<void> {
+  return Effect.runPromise(safeCloseTransportEffect(transport));
+}
+
+function safeCloseTransportEffect(transport: Transport) {
+  return Effect.tryPromise({ try: () => transport.close(), catch: (error) => error }).pipe(Effect.ignore);
 }
 
 function errorMessage(error: unknown) {
