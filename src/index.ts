@@ -278,11 +278,13 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     );
   }
 
-  async function proxySearch(query: string, regex: boolean, server: string | undefined, signal: AbortSignal | undefined) {
-    const pattern = buildSearchPattern(query, regex);
+  function proxySearch(query: string, regex: boolean, server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const pattern = buildSearchPattern(query, regex);
     if ("error" in pattern) return proxyText(pattern.error, pattern.details);
-    await ensureProxySearchMetadata(server, { signal });
-    const matches = proxyToolEntries()
+        yield* Effect.tryPromise({ try: () => ensureProxySearchMetadata(server, { signal }), catch: (error) => error });
+        const matches = proxyToolEntries()
       .filter((entry) => !server || entry.server === server)
       .filter((entry) => pattern.pattern.test(`${entry.key}\n${entry.name}\n${entry.server}\n${entry.tool.description ?? ""}`))
       .sort((a, b) => a.key.localeCompare(b.key));
@@ -307,14 +309,16 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     if (shown.length < matches.length) lines.push(`Showing first ${shown.length}. Narrow the search or use mcp({ server: "name" }).`);
     lines.push("Use mcp({ describe: \"tool_name\" }) for parameters before calling unfamiliar tools.");
 
-    return proxyText(lines.join("\n").trim(), {
-      mode: "search",
-      query,
-      server,
-      count: matches.length,
-      matches: shown.map((entry) => ({ server: entry.server, tool: entry.key, name: entry.name })),
-      truncated: shown.length < matches.length,
-    });
+        return proxyText(lines.join("\n").trim(), {
+          mode: "search",
+          query,
+          server,
+          count: matches.length,
+          matches: shown.map((entry) => ({ server: entry.server, tool: entry.key, name: entry.name })),
+          truncated: shown.length < matches.length,
+        });
+      }),
+    );
   }
 
   function proxyList(server: string, signal: AbortSignal | undefined) {
