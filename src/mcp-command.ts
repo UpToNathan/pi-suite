@@ -121,17 +121,17 @@ async function createMcpManagerView(manager: McpManager, config: McpConfig): Pro
   };
 }
 
-async function runMcpOperation<T>(
+function runMcpOperation<T>(
   ctx: ExtensionCommandContext,
   operation: string,
   execute: () => Promise<T>,
 ): Promise<T> {
   ctx.ui.setStatus("mcp-command", ctx.ui.theme.fg("accent", `mcp:${operation}`));
-  try {
-    return await execute();
-  } finally {
-    ctx.ui.setStatus("mcp-command", undefined);
-  }
+  return Effect.runPromise(
+    Effect.tryPromise({ try: execute, catch: (error) => error }).pipe(
+      Effect.ensuring(Effect.sync(() => ctx.ui.setStatus("mcp-command", undefined))),
+    ),
+  );
 }
 
 async function confirmMcpLogout(ctx: ExtensionCommandContext, server: string): Promise<boolean> {
