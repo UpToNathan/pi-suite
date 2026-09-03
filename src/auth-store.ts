@@ -222,19 +222,24 @@ export class AuthStore {
     );
   }
 
-  private async read(): Promise<AuthData> {
-    try {
-      if (!existsSync(this.filepath)) return {};
-      const parsed = JSON.parse(await readFile(this.filepath, "utf8"));
-      const result = parseAuthData(parsed);
-      if (result.rejected > 0) {
-        warnAuthStore(`ignored ${result.rejected} malformed persisted auth ${result.rejected === 1 ? "entry" : "entries"}`);
-      }
-      return result.data;
-    } catch (error) {
-      warnAuthStore(`ignored unreadable persisted auth store: ${safeAuthStoreError(error)}`);
-      return {};
-    }
+  private read(): Promise<AuthData> {
+    const filepath = this.filepath;
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        if (!existsSync(filepath)) return {};
+        const parsed = JSON.parse(yield* Effect.tryPromise({ try: () => readFile(filepath, "utf8"), catch: (error) => error }));
+        const result = parseAuthData(parsed);
+        if (result.rejected > 0) {
+          warnAuthStore(`ignored ${result.rejected} malformed persisted auth ${result.rejected === 1 ? "entry" : "entries"}`);
+        }
+        return result.data;
+      }).pipe(
+        Effect.catch((error) => {
+          warnAuthStore(`ignored unreadable persisted auth store: ${safeAuthStoreError(error)}`);
+          return Effect.succeed<AuthData>({});
+        }),
+      ),
+    );
   }
 
   private async write(data: AuthData): Promise<void> {
