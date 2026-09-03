@@ -69,18 +69,25 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     return manager;
   }
 
-  async function loadConfigured(ctx: ExtensionContext) {
-    latestContext = ctx;
-    const generation = configGeneration + 1;
-    configGeneration = generation;
-    config = await loadMcpConfig({ cwd: ctx.cwd });
-    const activeManager = await ensureManager(ctx);
-    const previous = registeredToolNames;
-    registeredToolNames = new Set();
-    await activeManager.initialize(config, { mode: "configure-only" });
-    registerDynamicTools();
-    deactivateTools([...previous].filter((name) => !registeredToolNames.has(name)));
-    return { activeManager, generation };
+  function loadConfigured(ctx: ExtensionContext) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        latestContext = ctx;
+        const generation = configGeneration + 1;
+        configGeneration = generation;
+        config = yield* Effect.tryPromise({ try: () => loadMcpConfig({ cwd: ctx.cwd }), catch: (error) => error });
+        const activeManager = yield* Effect.tryPromise({ try: () => ensureManager(ctx), catch: (error) => error });
+        const previous = registeredToolNames;
+        registeredToolNames = new Set();
+        yield* Effect.tryPromise({
+          try: () => activeManager.initialize(config, { mode: "configure-only" }),
+          catch: (error) => error,
+        });
+        registerDynamicTools();
+        deactivateTools([...previous].filter((name) => !registeredToolNames.has(name)));
+        return { activeManager, generation };
+      }),
+    );
   }
 
   function connectConfiguredServers(activeManager: McpManager, generation: number) {
