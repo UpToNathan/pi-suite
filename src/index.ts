@@ -317,15 +317,17 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     });
   }
 
-  async function proxyList(server: string, signal: AbortSignal | undefined) {
-    if (!config.servers[server]) {
+  function proxyList(server: string, signal: AbortSignal | undefined) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        if (!config.servers[server]) {
       return proxyText(`MCP server "${server}" is not configured. Use mcp({}) to see available servers.`, {
         mode: "list",
         server,
         error: "server_not_found",
       });
     }
-    await ensureProxyServerConnected(server, { signal });
+    yield* Effect.tryPromise({ try: () => ensureProxyServerConnected(server, { signal }), catch: (error) => error });
     const entries = proxyToolEntries().filter((entry) => entry.server === server).sort((a, b) => a.key.localeCompare(b.key));
     if (entries.length === 0) {
       const status = requireManager().status()[server]?.status ?? "disabled";
@@ -341,12 +343,14 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       lines.push(`- ${entry.key}${entry.tool.description ? ` — ${entry.tool.description}` : ""}`);
     }
     lines.push("", "Use mcp({ describe: \"tool_name\" }) for parameters.");
-    return proxyText(lines.join("\n"), {
-      mode: "list",
-      server,
-      count: entries.length,
-      tools: entries.map((entry) => entry.key),
-    });
+        return proxyText(lines.join("\n"), {
+          mode: "list",
+          server,
+          count: entries.length,
+          tools: entries.map((entry) => entry.key),
+        });
+      }),
+    );
   }
 
   async function proxyResources(server: string | undefined, signal: AbortSignal | undefined) {
