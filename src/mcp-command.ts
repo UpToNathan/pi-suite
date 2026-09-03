@@ -1,4 +1,5 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
 import type { Prompt } from "@modelcontextprotocol/client";
 import { formatMcpServerTarget } from "./display.js";
 import type { McpManager } from "./manager.js";
@@ -87,23 +88,29 @@ async function createMcpManagerView(manager: McpManager, config: McpConfig): Pro
   const toolCounts = new Map<string, number>();
   for (const tool of manager.getToolEntries()) toolCounts.set(tool.server, (toolCounts.get(tool.server) ?? 0) + 1);
 
-  const servers = await Promise.all(
-    Object.entries(config.servers)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(async ([name, serverConfig]): Promise<McpServerView> => {
-        const client = clients.get(name);
-        return {
-          name,
-          type: serverConfig.type,
-          target: formatMcpServerTarget(serverConfig),
-          status: statuses[name] ?? { status: "disabled" },
-          authStatus:
-            serverConfig.type === "remote" && serverConfig.oauth !== false ? await manager.authStatus(name) : undefined,
-          hasPrompts: client?.hasPrompts ?? false,
-          hasResources: client?.hasResources ?? false,
-          toolCount: toolCounts.get(name) ?? 0,
-        };
-      }),
+  const servers = await Effect.runPromise(
+    Effect.forEach(
+      Object.entries(config.servers).sort(([left], [right]) => left.localeCompare(right)),
+      ([name, serverConfig]) =>
+        Effect.tryPromise({
+          try: async (): Promise<McpServerView> => {
+            const client = clients.get(name);
+            return {
+              name,
+              type: serverConfig.type,
+              target: formatMcpServerTarget(serverConfig),
+              status: statuses[name] ?? { status: "disabled" },
+              authStatus:
+                serverConfig.type === "remote" && serverConfig.oauth !== false ? await manager.authStatus(name) : undefined,
+              hasPrompts: client?.hasPrompts ?? false,
+              hasResources: client?.hasResources ?? false,
+              toolCount: toolCounts.get(name) ?? 0,
+            };
+          },
+          catch: (error) => error,
+        }),
+      { concurrency: "unbounded" },
+    ),
   );
 
   return {
