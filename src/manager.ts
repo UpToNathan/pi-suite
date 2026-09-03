@@ -115,7 +115,7 @@ export class McpManager {
   private config: McpConfig = { servers: {} };
   private pendingOAuthTransports = new Map<string, TransportWithAuth>();
   private manuallyDisconnected = new Set<string>();
-  private connectionAttempts = new Map<string, Promise<McpStatus>>();
+  private connectionAttempts = new Map<string, Fiber.Fiber<McpStatus, unknown>>();
   private closed = false;
   private revision = 0;
 
@@ -271,13 +271,14 @@ export class McpManager {
         return Effect.fail(error);
       }
       const existing = self.connectionAttempts.get(name);
-      if (existing) return waitForConnectAttemptEffect(existing, options.signal);
+      if (existing) return waitForConnectAttemptEffect(Fiber.join(existing), options.signal);
       const revision = self.revision;
-      const attempt = Effect.runPromise(self.connectFreshEffect(name, serverConfig, revision, { signal: options.signal })).finally(() => {
+      const attempt = Effect.runFork(self.connectFreshEffect(name, serverConfig, revision, { signal: options.signal }));
+      self.connectionAttempts.set(name, attempt);
+      attempt.addObserver(() => {
         if (self.connectionAttempts.get(name) === attempt) self.connectionAttempts.delete(name);
       });
-      self.connectionAttempts.set(name, attempt);
-      return waitForConnectAttemptEffect(attempt, options.signal);
+      return waitForConnectAttemptEffect(Fiber.join(attempt), options.signal);
     });
   }
 
@@ -844,7 +845,12 @@ export class McpManager {
   }
 
   private closeConnectionAttemptsEffect() {
-    return Effect.sync(() => this.connectionAttempts.clear());
+    const attempts = Array.from(this.connectionAttempts.values());
+    this.connectionAttempts.clear();
+    return Effect.forEach(attempts, (attempt) => Fiber.interrupt(attempt), {
+      concurrency: "unbounded",
+      discard: true,
+    });
   }
 
   private emitStatusChangedEffect() {
@@ -1016,15 +1022,14 @@ function findToolKeyCollision(clients: ReadonlyMap<string, ManagedClient>) {
   return undefined;
 }
 
-function waitForConnectAttemptEffect(attempt: Promise<McpStatus>, signal: AbortSignal | undefined) {
-  const awaited = Effect.tryPromise({ try: () => attempt, catch: (error) => error });
-  if (!signal) return awaited;
+function waitForConnectAttemptEffect<E, R>(attempt: Effect.Effect<McpStatus, E, R>, signal: AbortSignal | undefined) {
+  if (!signal) return attempt;
   const aborted = Effect.callback<never, DOMException>((resume) => {
     const handler = () => resume(Effect.fail(new DOMException("MCP connect aborted", "AbortError")));
     signal.addEventListener("abort", handler, { once: true });
     return Effect.sync(() => signal.removeEventListener("abort", handler));
   });
-  return Effect.sync(() => signal.throwIfAborted()).pipe(Effect.andThen(Effect.race(awaited, aborted)));
+  return Effect.sync(() => signal.throwIfAborted()).pipe(Effect.andThen(Effect.race(attempt, aborted)));
 }
 
 function sdkRequestOptions(timeout: number, signal: AbortSignal | undefined) {
