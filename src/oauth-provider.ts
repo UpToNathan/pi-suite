@@ -10,6 +10,7 @@ import { Effect, Semaphore } from "effect";
 import type { AuthClientInfo, AuthDiscoveryState, AuthTokens, OAuthConfig } from "./types.js";
 import { AuthStore, type AuthRefreshLock, type AuthWriteFence } from "./auth-store.js";
 import { randomHex } from "./random.js";
+import { OAuthError } from "./errors.js";
 
 const MAX_REFRESH_LOCK_HOLD_MILLISECONDS = 120_000;
 
@@ -199,7 +200,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         Effect.flatMap((entry) =>
           entry?.codeVerifier
             ? Effect.succeed(entry.codeVerifier)
-            : Effect.fail(new Error(`No code verifier saved for MCP server: ${mcpName}`)),
+            : Effect.fail(new OAuthError({ message: `No code verifier saved for MCP server: ${mcpName}` })),
         ),
       ),
     );
@@ -220,7 +221,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         if (entry?.oauthState) return entry.oauthState;
         const state = randomHex();
         yield* self.auth.updateOAuthStateEffect(self.mcpName, state, self.writeFence);
-        if (!self.active) return yield* Effect.fail(new Error(`OAuth provider is inactive for MCP server: ${self.mcpName}`));
+        if (!self.active) return yield* Effect.fail(new OAuthError({ message: `OAuth provider is inactive for MCP server: ${self.mcpName}` }));
         return state;
       }),
     );
@@ -279,7 +280,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         const refreshLock = yield* self.auth.acquireOAuthRefreshLockEffect(self.mcpName);
         if (!self.active) {
           yield* refreshLock.releaseEffect;
-          return yield* Effect.fail(new Error(`OAuth provider is inactive for MCP server: ${self.mcpName}`));
+          return yield* Effect.fail(new OAuthError({ message: `OAuth provider is inactive for MCP server: ${self.mcpName}` }));
         }
         self.refreshLock = refreshLock;
         if (!self.refreshLockTimeout) {

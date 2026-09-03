@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { lock } from "proper-lockfile";
 import type { AuthClientInfo, AuthDiscoveryState, AuthEntry, AuthStatus, AuthTokens } from "./types.js";
+import { AuthStoreError } from "./errors.js";
 
 type AuthData = Record<string, AuthEntry>;
 
@@ -149,6 +150,7 @@ export class AuthStore {
     const digest = createHash("sha256").update(mcpName).digest("hex");
     const target = `${this.filepath}.refresh-${digest}`;
     return Effect.tryPromise({ try: () => acquireInterprocessLock(target), catch: (error) => error }).pipe(
+      Effect.mapError((cause) => new AuthStoreError({ message: `Could not acquire OAuth refresh lock for ${mcpName}`, cause })),
       Effect.map((release): AuthRefreshLock => {
         let released = false;
         const releaseEffect = Effect.suspend(() => {
@@ -306,6 +308,8 @@ export class AuthStore {
           yield* self.writeEffect(update(yield* self.readEffect()));
         }),
       ),
+    ).pipe(
+      Effect.mapError((cause) => new AuthStoreError({ message: "Could not persist MCP OAuth state", cause })),
     );
   }
 

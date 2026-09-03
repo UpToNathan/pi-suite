@@ -960,7 +960,7 @@ class PausingAuthStore extends AuthStore {
 
   override updateTokensEffect(mcpName: string, tokens: AuthTokens, serverUrl?: string, fence?: AuthWriteFence) {
     this.reachedPause.resolve();
-    return Effect.tryPromise({ try: () => this.resumePause.promise, catch: (error) => error }).pipe(
+    return Effect.promise(() => this.resumePause.promise).pipe(
       Effect.andThen(super.updateTokensEffect(mcpName, tokens, serverUrl, fence)),
     );
   }

@@ -45,7 +45,7 @@ export function runMcpCommand(
           continue;
         case "connect": {
           const status = yield* Effect.tryPromise({
-            try: () => runMcpOperation(ctx, "connecting", () => manager.connect(action.server.name, { intent: "explicit", signal: undefined })),
+            try: () => runMcpOperation(ctx, "connecting", () => Effect.runPromise(manager.connectEffect(action.server.name, { intent: "explicit", signal: undefined }))),
             catch: (error) => error,
           });
           dependencies.refreshRuntime(ctx);
@@ -53,7 +53,10 @@ export function runMcpCommand(
           continue;
         }
         case "disconnect":
-          yield* Effect.tryPromise({ try: () => runMcpOperation(ctx, "disconnecting", () => manager.disconnect(action.server.name)), catch: (error) => error });
+          yield* Effect.tryPromise({
+            try: () => runMcpOperation(ctx, "disconnecting", () => Effect.runPromise(manager.disconnectEffect(action.server.name))),
+            catch: (error) => error,
+          });
           dependencies.refreshRuntime(ctx);
           ctx.ui.notify(`Disconnected MCP server ${action.server.name}`, "info");
           continue;
@@ -102,7 +105,7 @@ async function createMcpManagerView(manager: McpManager, config: McpConfig): Pro
           const client = clients.get(name);
           const authStatus =
             serverConfig.type === "remote" && serverConfig.oauth !== false
-              ? yield* Effect.tryPromise({ try: () => manager.authStatus(name), catch: (error) => error })
+              ? yield* manager.authStatusEffect(name)
               : undefined;
           const view: McpServerView = {
             name,
@@ -154,7 +157,7 @@ function runMcpPrompt(
   return Effect.runPromise(
     Effect.gen(function* () {
       const result = yield* Effect.tryPromise({
-        try: () => runMcpOperation(ctx, "loading-prompts", () => manager.prompts({ signal: undefined })),
+        try: () => runMcpOperation(ctx, "loading-prompts", () => Effect.runPromise(manager.promptsEffect({ signal: undefined }))),
         catch: (error) => error,
       });
   const prompts = result.prompts.filter((prompt) => prompt.client === server);
@@ -173,7 +176,7 @@ function runMcpPrompt(
   const args = yield* Effect.tryPromise({ try: () => collectPromptArguments(ctx, selected), catch: (error) => error });
   if (args === undefined) return false;
   const prompt = yield* Effect.tryPromise({
-    try: () => runMcpOperation(ctx, "fetching-prompt", () => manager.getPrompt(server, selected.name, args, { signal: undefined })),
+    try: () => runMcpOperation(ctx, "fetching-prompt", () => Effect.runPromise(manager.getPromptEffect(server, selected.name, args, { signal: undefined }))),
     catch: (error) => error,
   });
   const text = prompt.messages

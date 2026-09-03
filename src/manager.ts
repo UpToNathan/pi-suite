@@ -25,6 +25,7 @@ import { mcpToolKey, sanitizeName } from "./tool-names.js";
 import { withTimeoutEffect } from "./timeout.js";
 import { listPromptsEffect, listResourcesEffect, listTools } from "./catalog.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
+import { McpManagerError } from "./errors.js";
 import {
   NodeOAuthCallbackRuntime,
   type OAuthCallbackRuntime,
@@ -142,10 +143,7 @@ export class McpManager {
       }
 
       if (options.mode === "connect") {
-        yield* Effect.tryPromise({
-          try: () => self.connectAll({ intent: options.intent, signal: options.signal }),
-          catch: (error) => error,
-        });
+        yield* self.connectAllEffect({ intent: options.intent, signal: options.signal });
         return;
       }
       yield* self.emitStatusChangedEffect();
@@ -153,57 +151,36 @@ export class McpManager {
   }
 
   /** Connects every eligible configured MCP server in parallel and returns the latest status snapshot. */
-  async connectAll(options: McpConnectAllOptions): Promise<Record<string, McpStatus>> {
-    const targets = Object.entries(this.config.servers).filter(([name, serverConfig]) => {
-      const status = this.statuses.get(name);
+  connectAll(options: McpConnectAllOptions): Promise<Record<string, McpStatus>> {
+    return Effect.runPromise(this.connectAllEffect(options));
+  }
 
-      if (options.intent === "automatic") {
-        return this.canAutoConnect(name, serverConfig, status);
-      }
-
-      return this.canExplicitConnect(serverConfig);
-    });
-
-    const settled = await Effect.runPromise(
-      Effect.all(
-        targets.map(([name]) =>
-          Effect.tryPromise({
-            try: () =>
-              this.connect(name, {
-                intent: options.intent,
-                signal: options.signal,
-              }),
-            catch: (reason) => reason,
-          }),
-        ),
-        { concurrency: "unbounded", mode: "result" },
-      ),
-    );
-
-    let hasUnhandledFailure = false;
-
-    for (let index = 0; index < settled.length; index++) {
-      const result = settled[index];
-      const target = targets[index];
-
-      if (!result || !target) continue;
-      if (result._tag === "Success") continue;
-
-      if (isAbortError(result.failure)) {
-        throw result.failure;
-      }
-
-      this.statuses.set(target[0], {
-        status: "failed",
-        error: errorMessage(result.failure),
+  /** Effect-native parallel connection of eligible servers. */
+  connectAllEffect(options: McpConnectAllOptions) {
+    const self = this;
+    return Effect.gen(function* () {
+      const targets = Object.entries(self.config.servers).filter(([name, serverConfig]) => {
+        const status = self.statuses.get(name);
+        return options.intent === "automatic"
+          ? self.canAutoConnect(name, serverConfig, status)
+          : self.canExplicitConnect(serverConfig);
       });
-
-      hasUnhandledFailure = true;
-    }
-
-    if (hasUnhandledFailure) await this.emitStatusChanged();
-
-    return this.status();
+      const settled = yield* Effect.all(
+        targets.map(([name]) => self.connectEffect(name, { intent: options.intent, signal: options.signal })),
+        { concurrency: "unbounded", mode: "result" },
+      );
+      let hasUnhandledFailure = false;
+      for (let index = 0; index < settled.length; index++) {
+        const result = settled[index];
+        const target = targets[index];
+        if (!result || !target || result._tag === "Success") continue;
+        if (isAbortError(result.failure)) return yield* Effect.fail(result.failure);
+        self.statuses.set(target[0], { status: "failed", error: errorMessage(result.failure) });
+        hasUnhandledFailure = true;
+      }
+      if (hasUnhandledFailure) yield* self.emitStatusChangedEffect();
+      return self.status();
+    });
   }
 
   /** Returns connection status for every configured MCP server. */
@@ -260,58 +237,59 @@ export class McpManager {
   }
 
   /** Connects or reconnects one configured MCP server. */
-  async connect(name: string, options: McpConnectOptions): Promise<McpStatus> {
-    const serverConfig = this.config.servers[name];
-    if (!serverConfig) throw new Error(`MCP server not found: ${name}`);
+  connect(name: string, options: McpConnectOptions): Promise<McpStatus> {
+    return Effect.runPromise(this.connectEffect(name, options));
+  }
 
-    const currentStatus = this.statuses.get(name);
-
-    if (options.intent === "automatic") {
-      if (!this.canAutoConnect(name, serverConfig, currentStatus)) {
-        return currentStatus ?? { status: "disabled" };
+  /** Effect-native connection or reconnection of one server. */
+  connectEffect(name: string, options: McpConnectOptions) {
+    const self = this;
+    return Effect.suspend(() => {
+      const serverConfig = self.config.servers[name];
+      if (!serverConfig) return Effect.fail(new McpManagerError({ message: `MCP server not found: ${name}` }));
+      const currentStatus = self.statuses.get(name);
+      if (options.intent === "automatic" && !self.canAutoConnect(name, serverConfig, currentStatus)) {
+        return Effect.succeed(currentStatus ?? { status: "disabled" as const });
       }
-    }
-
-    if (options.intent === "explicit") {
-      if (!this.canExplicitConnect(serverConfig)) {
-        const disabled = { status: "disabled" as const };
-        this.statuses.set(name, disabled);
-        return disabled;
+      if (options.intent === "explicit") {
+        if (!self.canExplicitConnect(serverConfig)) {
+          const disabled = { status: "disabled" as const };
+          self.statuses.set(name, disabled);
+          return Effect.succeed(disabled);
+        }
+        self.manuallyDisconnected.delete(name);
       }
-
-      this.manuallyDisconnected.delete(name);
-    }
-
-    options.signal?.throwIfAborted();
-
-    const existing = this.connectionAttempts.get(name);
-    if (existing) {
-      return waitForConnectAttempt(existing, options.signal);
-    }
-
-    const revision = this.revision;
-    const attempt = this.connectFresh(name, serverConfig, revision, {
-      signal: options.signal,
-    }).finally(() => {
-      if (this.connectionAttempts.get(name) === attempt) {
-        this.connectionAttempts.delete(name);
+      try {
+        options.signal?.throwIfAborted();
+      } catch (error) {
+        return Effect.fail(error);
       }
+      const existing = self.connectionAttempts.get(name);
+      if (existing) return waitForConnectAttemptEffect(existing, options.signal);
+      const revision = self.revision;
+      const attempt = self.connectFresh(name, serverConfig, revision, { signal: options.signal }).finally(() => {
+        if (self.connectionAttempts.get(name) === attempt) self.connectionAttempts.delete(name);
+      });
+      self.connectionAttempts.set(name, attempt);
+      return waitForConnectAttemptEffect(attempt, options.signal);
     });
-
-    this.connectionAttempts.set(name, attempt);
-
-    return waitForConnectAttempt(attempt, options.signal);
   }
 
   /** Disconnects one configured MCP server for the current runtime. */
-  async disconnect(name: string) {
-    if (!this.config.servers[name]) throw new Error(`MCP server not found: ${name}`);
+  disconnect(name: string) {
+    return Effect.runPromise(this.disconnectEffect(name));
+  }
 
-    this.manuallyDisconnected.add(name);
-
-    await this.disconnectClient(name, { status: "disabled" });
-    await this.options.onToolsChanged?.(name);
-    await this.emitStatusChanged();
+  /** Effect-native disconnection of one server. */
+  disconnectEffect(name: string) {
+    const self = this;
+    return Effect.gen(function* () {
+      if (!self.config.servers[name]) return yield* Effect.fail(new McpManagerError({ message: `MCP server not found: ${name}` }));
+      self.manuallyDisconnected.add(name);
+      yield* Effect.tryPromise({ try: () => self.disconnectClient(name, { status: "disabled" }), catch: (error) => error });
+      yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
+      yield* self.emitStatusChangedEffect();
+    });
   }
 
   /** Lists resources exposed by connected MCP servers, optionally restricted to one server. */
@@ -366,7 +344,7 @@ export class McpManager {
   /** Effect-native prompt fetch. */
   getPromptEffect(clientName: string, name: string, args: Record<string, string> | undefined, options: CancellableOptions) {
     const managed = this.clients.get(clientName);
-    if (!managed) return Effect.fail(new Error(`MCP server "${clientName}" is not connected`));
+    if (!managed) return Effect.fail(new McpManagerError({ message: `MCP server "${clientName}" is not connected` }));
     return Effect.tryPromise({
       try: () => managed.client.getPrompt(
         { name, arguments: args },
@@ -384,8 +362,8 @@ export class McpManager {
   /** Effect-native resource read. */
   readResourceEffect(clientName: string, uri: string, options: CancellableOptions) {
     const managed = this.clients.get(clientName);
-    if (!managed) return Effect.fail(new Error(`MCP server "${clientName}" is not connected`));
-    if (!managed.client.getServerCapabilities()?.resources) return Effect.fail(new Error(`MCP server "${clientName}" does not support resources`));
+    if (!managed) return Effect.fail(new McpManagerError({ message: `MCP server "${clientName}" is not connected` }));
+    if (!managed.client.getServerCapabilities()?.resources) return Effect.fail(new McpManagerError({ message: `MCP server "${clientName}" does not support resources` }));
     return Effect.tryPromise({
       try: () => managed.client.readResource(
         { uri },
@@ -433,18 +411,29 @@ export class McpManager {
   }
 
   /** Removes stored OAuth state and cancels any in-flight authorization for one MCP server. */
-  async removeAuth(name: string): Promise<void> {
+  removeAuth(name: string): Promise<void> {
+    return Effect.runPromise(this.removeAuthEffect(name));
+  }
+
+  /** Effect-native removal of stored authorization. */
+  removeAuthEffect(name: string) {
     this.deactivateOAuthProviders(name);
     this.oauthCallbacks.cancel(name);
     const pendingTransport = this.pendingOAuthTransports.get(name);
     this.pendingOAuthTransports.delete(name);
-    if (pendingTransport) await safeCloseTransport(pendingTransport);
-    await this.auth.remove(name);
+    return (pendingTransport ? safeCloseTransportEffect(pendingTransport) : Effect.void).pipe(
+      Effect.andThen(this.auth.removeEffect(name)),
+    );
   }
 
   /** Returns the persisted OAuth status for one MCP server. */
-  async authStatus(name: string): Promise<AuthStatus> {
-    return this.auth.authStatus(name);
+  authStatus(name: string): Promise<AuthStatus> {
+    return Effect.runPromise(this.authStatusEffect(name));
+  }
+
+  /** Effect-native persisted authorization status. */
+  authStatusEffect(name: string) {
+    return this.auth.authStatusEffect(name);
   }
 
   /** Closes all connected MCP clients and any local OAuth callback listener. */
@@ -1058,19 +1047,15 @@ function findToolKeyCollision(clients: ReadonlyMap<string, ManagedClient>) {
   return undefined;
 }
 
-function waitForConnectAttempt(attempt: Promise<McpStatus>, signal: AbortSignal | undefined): Promise<McpStatus> {
-  signal?.throwIfAborted();
-  if (!signal) return attempt;
-
+function waitForConnectAttemptEffect(attempt: Promise<McpStatus>, signal: AbortSignal | undefined) {
+  const awaited = Effect.tryPromise({ try: () => attempt, catch: (error) => error });
+  if (!signal) return awaited;
   const aborted = Effect.callback<never, DOMException>((resume) => {
     const handler = () => resume(Effect.fail(new DOMException("MCP connect aborted", "AbortError")));
     signal.addEventListener("abort", handler, { once: true });
     return Effect.sync(() => signal.removeEventListener("abort", handler));
   });
-
-  return Effect.runPromise(
-    Effect.race(Effect.tryPromise({ try: () => attempt, catch: (error) => error }), aborted),
-  );
+  return Effect.sync(() => signal.throwIfAborted()).pipe(Effect.andThen(Effect.race(awaited, aborted)));
 }
 
 function sdkRequestOptions(timeout: number, signal: AbortSignal | undefined) {
