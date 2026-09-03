@@ -22,7 +22,7 @@ import { redactSecrets } from "./display.js";
 import { randomHex } from "./random.js";
 import { DEFAULT_TIMEOUT } from "./request-limits.js";
 import { mcpToolKey, sanitizeName } from "./tool-names.js";
-import { withTimeout } from "./timeout.js";
+import { withTimeoutEffect } from "./timeout.js";
 import { listPrompts, listResources, listTools } from "./catalog.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
 import {
@@ -621,12 +621,19 @@ export class McpManager {
     return { status: lastStatus ?? { status: "failed", error: "Unknown MCP connection error" } };
   }
 
-  private async connectTransport(name: string, transport: Transport, timeout: number, options: CancellableOptions) {
-    options.signal?.throwIfAborted();
+  private connectTransport(name: string, transport: Transport, timeout: number, options: CancellableOptions) {
+    return Effect.runPromise(this.connectTransportEffect(name, transport, timeout, options));
+  }
 
+  private connectTransportEffect(name: string, transport: Transport, timeout: number, options: CancellableOptions) {
+    options.signal?.throwIfAborted();
     const client = this.createClient(name);
-    await withTimeout(client.connect(transport), timeout, "MCP connect", { signal: undefined });
-    return client;
+    return withTimeoutEffect(
+      Effect.tryPromise({ try: () => client.connect(transport), catch: (error) => error }),
+      timeout,
+      "MCP connect",
+      options,
+    ).pipe(Effect.as(client));
   }
 
   private createClient(server = "unknown") {
