@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -12,6 +13,7 @@ const AUTH_WRITE_FENCE = Symbol("AuthWriteFence");
 const AUTH_REFRESH_LOCK = Symbol("AuthRefreshLock");
 const AUTH_LOCK_STALE_MILLISECONDS = 30_000;
 const AUTH_LOCK_UPDATE_MILLISECONDS = 5_000;
+const nativeFs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
 const AUTH_LOCK_RETRY_OPTIONS = {
   retries: 100,
   factor: 1.15,
@@ -263,6 +265,8 @@ async function acquireInterprocessLock(target: string): Promise<() => Promise<vo
     stale: AUTH_LOCK_STALE_MILLISECONDS,
     update: AUTH_LOCK_UPDATE_MILLISECONDS,
     retries: AUTH_LOCK_RETRY_OPTIONS,
+    // proper-lockfile caches metadata on fs; bypass Bun's proxied module object.
+    fs: nativeFs,
   });
   try {
     await chmod(`${target}.lock`, 0o700);
