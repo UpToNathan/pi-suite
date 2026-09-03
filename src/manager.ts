@@ -870,19 +870,21 @@ export class McpManager {
 
     try {
       const subprocess = await open(url);
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, 500);
-        subprocess.on("error", (error) => {
-          clearTimeout(timer);
-          reject(error);
-        });
-        subprocess.on("exit", (code) => {
-          if (code !== null && code !== 0) {
+      await Effect.runPromise(
+        Effect.callback<void, Error>((resume) => {
+          const timer = setTimeout(() => resume(Effect.succeed(undefined)), 500);
+          subprocess.on("error", (error) => {
             clearTimeout(timer);
-            reject(new Error(`Browser open failed with exit code ${code}`));
-          }
-        });
-      });
+            resume(Effect.fail(error));
+          });
+          subprocess.on("exit", (code) => {
+            if (code !== null && code !== 0) {
+              clearTimeout(timer);
+              resume(Effect.fail(new Error(`Browser open failed with exit code ${code}`)));
+            }
+          });
+        }),
+      );
     } catch {
       await onAuthorizationUrl?.(url);
     }
