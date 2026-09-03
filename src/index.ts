@@ -62,7 +62,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     manager = new McpManager({
       cwd: ctx.cwd,
       onElicitation: (server, request) => handlePiElicitation(server, request, elicitationContexts.getStore() ?? latestContext),
-      onToolsChanged: async () => {
+      onToolsChanged: () => {
         registerDynamicTools();
       },
     });
