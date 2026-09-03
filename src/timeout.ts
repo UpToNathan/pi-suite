@@ -1,39 +1,38 @@
+import { Effect } from "effect";
 import type { CancellableOptions } from "./types.js";
 
-/**
- * Races a promise against a timeout and caller-owned cancellation, then clears listeners after either branch settles.
- *
- * @template T Promise fulfillment type preserved by the timeout wrapper.
+/** Effect-native timeout and cancellation wrapper.
+ * @template T Effect success type preserved by the wrapper.
  */
-export async function withTimeout<T>(promise: Promise<T>, timeout: number, label: string, options: CancellableOptions): Promise<T> {
+export function withTimeoutEffect<T>(
+  effect: Effect.Effect<T, unknown>,
+  timeout: number,
+  label: string,
+  options: CancellableOptions,
+) {
+  const signal = options.signal;
+  const cancelled = signal
+    ? Effect.callback<never, DOMException>((resume) => {
+        const handler = () => resume(Effect.fail(new DOMException(`${label} aborted`, "AbortError")));
+        signal.addEventListener("abort", handler, { once: true });
+        return Effect.sync(() => signal.removeEventListener("abort", handler));
+      })
+    : Effect.never;
+
+  return Effect.race(effect, cancelled).pipe(
+    Effect.timeoutOrElse({
+      duration: timeout,
+      orElse: () => Effect.fail(new Error(`${label} timed out after ${timeout}ms`)),
+    }),
+  );
+}
+
+/** Promise adapter for third-party SDK calls.
+ * @template T Promise fulfillment type preserved by the adapter.
+ */
+export function withTimeout<T>(promise: Promise<T>, timeout: number, label: string, options: CancellableOptions): Promise<T> {
   options.signal?.throwIfAborted();
-
-  let timer: NodeJS.Timeout | undefined;
-  let abortHandler: (() => void) | undefined;
-
-  const timeoutPromise = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeout}ms`)), timeout);
-  });
-
-  const abortPromise = new Promise<never>((_resolve, reject) => {
-    if (!options.signal) return;
-
-    abortHandler = () => {
-      reject(new DOMException(`${label} aborted`, "AbortError"));
-    };
-
-    options.signal.addEventListener("abort", abortHandler, { once: true });
-  });
-
-  void promise.catch(() => undefined);
-
-  try {
-    return await Promise.race([promise, timeoutPromise, abortPromise]);
-  } finally {
-    if (timer) clearTimeout(timer);
-
-    if (options.signal && abortHandler) {
-      options.signal.removeEventListener("abort", abortHandler);
-    }
-  }
+  return Effect.runPromise(
+    withTimeoutEffect(Effect.tryPromise({ try: () => promise, catch: (error) => error }), timeout, label, options),
+  );
 }
