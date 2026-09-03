@@ -196,14 +196,16 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     });
   }
 
-  async function executeMcpProxy(params: unknown, signal: AbortSignal | undefined) {
-    const args = isPlainRecord(params) ? params : {};
+  function executeMcpProxy(params: unknown, signal: AbortSignal | undefined) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const args = isPlainRecord(params) ? params : {};
     const action = optionalString(args, "action");
     const server = optionalString(args, "server");
     const parsedArgs = parseProxyJsonArgs(optionalString(args, "args"));
 
-    if (action === "resources") return proxyResources(server, signal);
-    if (action === "read-resource") return proxyReadResource(server, optionalString(args, "uri"), signal);
+    if (action === "resources") return yield* Effect.tryPromise({ try: () => proxyResources(server, signal), catch: (error) => error });
+    if (action === "read-resource") return yield* Effect.tryPromise({ try: () => proxyReadResource(server, optionalString(args, "uri"), signal), catch: (error) => error });
     if (action !== undefined && action !== "status") {
       return proxyText(`Unknown MCP action "${action}". Supported actions: status, resources, read-resource.`, {
         mode: "error",
@@ -213,19 +215,21 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     }
 
     const tool = optionalString(args, "tool");
-    if (tool) return proxyCall(tool, parsedArgs, server, signal);
+    if (tool) return yield* Effect.tryPromise({ try: () => proxyCall(tool, parsedArgs, server, signal), catch: (error) => error });
 
     const connect = optionalString(args, "connect");
-    if (connect) return proxyConnect(connect);
+    if (connect) return yield* Effect.tryPromise({ try: () => proxyConnect(connect), catch: (error) => error });
 
     const describe = optionalString(args, "describe");
-    if (describe) return proxyDescribe(describe, server, signal);
+    if (describe) return yield* Effect.tryPromise({ try: () => proxyDescribe(describe, server, signal), catch: (error) => error });
 
     const search = optionalString(args, "search");
-    if (search) return proxySearch(search, typeof args.regex === "boolean" ? args.regex : false, server, signal);
+    if (search) return yield* Effect.tryPromise({ try: () => proxySearch(search, typeof args.regex === "boolean" ? args.regex : false, server, signal), catch: (error) => error });
 
-    if (server) return proxyList(server, signal);
+    if (server) return yield* Effect.tryPromise({ try: () => proxyList(server, signal), catch: (error) => error });
     return proxyStatus();
+      }),
+    );
   }
 
   function proxyCall(toolName: string, args: Record<string, unknown>, server: string | undefined, signal: AbortSignal | undefined) {
