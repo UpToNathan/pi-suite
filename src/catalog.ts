@@ -50,28 +50,34 @@ function paginateEffect<T, R extends { nextCursor?: string | undefined }>(
 }
 
 /** Lists tools from an MCP client while rejecting cursor loops. */
-export async function listTools(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Tool[]> {
-  return paginate(
-    (cursor) => client.listTools(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
-    (result) => result.tools,
+export function listTools(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Tool[]> {
+  return Effect.runPromise(
+    paginateEffect(
+      (cursor) => client.listTools(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
+      (result) => result.tools,
+    ),
   );
 }
 
 /** Lists prompts from an MCP client when the server advertises prompt support. */
-export async function listPrompts(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Prompt[]> {
-  if (!client.getServerCapabilities()?.prompts) return [];
-  return paginate(
-    (cursor) => client.listPrompts(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
-    (result) => result.prompts,
+export function listPrompts(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Prompt[]> {
+  if (!client.getServerCapabilities()?.prompts) return Promise.resolve([]);
+  return Effect.runPromise(
+    paginateEffect(
+      (cursor) => client.listPrompts(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
+      (result) => result.prompts,
+    ),
   );
 }
 
 /** Lists resources from an MCP client when the server advertises resource support. */
-export async function listResources(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Resource[]> {
-  if (!client.getServerCapabilities()?.resources) return [];
-  return paginate(
-    (cursor) => client.listResources(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
-    (result) => result.resources,
+export function listResources(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Resource[]> {
+  if (!client.getServerCapabilities()?.resources) return Promise.resolve([]);
+  return Effect.runPromise(
+    paginateEffect(
+      (cursor) => client.listResources(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
+      (result) => result.resources,
+    ),
   );
 }
 
