@@ -446,26 +446,35 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     await ensureProxyServersConnected(options);
   }
 
-  async function ensureProxyServerConnected(server: string, options: CancellableOptions) {
-    if (!config.servers[server]) return;
-
-    await requireManager().connect(server, {
-      intent: "automatic",
-      signal: options.signal,
-    });
-
-    registerDynamicTools();
-    updateLatestMcpStatus();
+  function ensureProxyServerConnected(server: string, options: CancellableOptions) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        if (!config.servers[server]) return;
+        yield* Effect.tryPromise({
+          try: () => requireManager().connect(server, { intent: "automatic", signal: options.signal }),
+          catch: (error) => error,
+        });
+        yield* Effect.sync(() => {
+          registerDynamicTools();
+          updateLatestMcpStatus();
+        });
+      }),
+    );
   }
 
-  async function ensureProxyServersConnected(options: CancellableOptions) {
-    await requireManager().connectAll({
-      intent: "automatic",
-      signal: options.signal,
-    });
-
-    registerDynamicTools();
-    updateLatestMcpStatus();
+  function ensureProxyServersConnected(options: CancellableOptions) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        yield* Effect.tryPromise({
+          try: () => requireManager().connectAll({ intent: "automatic", signal: options.signal }),
+          catch: (error) => error,
+        });
+        yield* Effect.sync(() => {
+          registerDynamicTools();
+          updateLatestMcpStatus();
+        });
+      }),
+    );
   }
 
   function proxyToolEntries() {
