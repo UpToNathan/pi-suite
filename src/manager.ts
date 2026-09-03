@@ -1006,28 +1006,19 @@ function findToolKeyCollision(clients: ReadonlyMap<string, ManagedClient>) {
   return undefined;
 }
 
-async function waitForConnectAttempt(attempt: Promise<McpStatus>, signal: AbortSignal | undefined): Promise<McpStatus> {
+function waitForConnectAttempt(attempt: Promise<McpStatus>, signal: AbortSignal | undefined): Promise<McpStatus> {
   signal?.throwIfAborted();
-
   if (!signal) return attempt;
 
-  let abortHandler: (() => void) | undefined;
-
-  const abortPromise = new Promise<never>((_resolve, reject) => {
-    abortHandler = () => {
-      reject(new DOMException("MCP connect aborted", "AbortError"));
-    };
-
-    signal.addEventListener("abort", abortHandler, { once: true });
+  const aborted = Effect.callback<never, DOMException>((resume) => {
+    const handler = () => resume(Effect.fail(new DOMException("MCP connect aborted", "AbortError")));
+    signal.addEventListener("abort", handler, { once: true });
+    return Effect.sync(() => signal.removeEventListener("abort", handler));
   });
 
-  try {
-    return await Promise.race([attempt, abortPromise]);
-  } finally {
-    if (abortHandler) {
-      signal.removeEventListener("abort", abortHandler);
-    }
-  }
+  return Effect.runPromise(
+    Effect.race(Effect.tryPromise({ try: () => attempt, catch: (error) => error }), aborted),
+  );
 }
 
 function sdkRequestOptions(timeout: number, signal: AbortSignal | undefined) {
