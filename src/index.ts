@@ -228,17 +228,25 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     return proxyStatus();
   }
 
-  async function proxyCall(toolName: string, args: Record<string, unknown>, server: string | undefined, signal: AbortSignal | undefined) {
-    await ensureProxyToolMetadata(toolName, server, { signal });
-    const found = findProxyTool(toolName, server);
-    if ("error" in found) return proxyText(found.error, found.details);
-    return callMcpTool({
-      client: found.entry.client,
-      tool: found.entry.tool,
-      args,
-      timeout: found.entry.timeout,
-      signal,
-    });
+  function proxyCall(toolName: string, args: Record<string, unknown>, server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        yield* Effect.tryPromise({ try: () => ensureProxyToolMetadata(toolName, server, { signal }), catch: (error) => error });
+        const found = findProxyTool(toolName, server);
+        if ("error" in found) return proxyText(found.error, found.details);
+        return yield* Effect.tryPromise({
+          try: () =>
+            callMcpTool({
+              client: found.entry.client,
+              tool: found.entry.tool,
+              args,
+              timeout: found.entry.timeout,
+              signal,
+            }),
+          catch: (error) => error,
+        });
+      }),
+    );
   }
 
   async function proxyConnect(server: string) {
