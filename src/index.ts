@@ -651,15 +651,20 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       await runMcpCommand(ctx, {
         ensureManager: async (commandContext) => ensureManager(commandContext),
         getConfig: () => config,
-        reload: async (commandContext) => {
-          const loaded = await loadConfigured(commandContext);
-          await loaded.activeManager.connectAll({
-            intent: "explicit",
-            signal: undefined,
-          });
-          registerDynamicTools();
-          updateMcpStatus(commandContext);
-        },
+        reload: (commandContext) =>
+          Effect.runPromise(
+            Effect.gen(function* () {
+              const loaded = yield* Effect.tryPromise({ try: () => loadConfigured(commandContext), catch: (error) => error });
+              yield* Effect.tryPromise({
+                try: () => loaded.activeManager.connectAll({ intent: "explicit", signal: undefined }),
+                catch: (error) => error,
+              });
+              yield* Effect.sync(() => {
+                registerDynamicTools();
+                updateMcpStatus(commandContext);
+              });
+            }),
+          ),
         refreshRuntime: (commandContext) => {
           registerDynamicTools();
           updateMcpStatus(commandContext);
