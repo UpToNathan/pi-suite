@@ -60,20 +60,33 @@ export class AuthStore {
 
   /** Reads every valid persisted auth entry keyed by configured MCP server name. */
   all(): Promise<AuthData> {
-    return this.withLock(() => this.read());
+    return Effect.runPromise(this.allEffect());
+  }
+
+  private allEffect() {
+    return this.mutex.withPermits(1)(this.readEffect());
   }
 
   /** Reads one valid persisted auth entry, if present. */
-  async get(mcpName: string): Promise<AuthEntry | undefined> {
-    const data = await this.all();
-    return data[mcpName];
+  get(mcpName: string): Promise<AuthEntry | undefined> {
+    return Effect.runPromise(this.getEffect(mcpName));
+  }
+
+  /** Effect-native read of one persisted auth entry. */
+  getEffect(mcpName: string) {
+    return this.allEffect().pipe(Effect.map((data) => data[mcpName]));
   }
 
   /** Reads an auth entry only when it was saved for the same remote server URL. */
-  async getForUrl(mcpName: string, serverUrl: string) {
-    const entry = await this.get(mcpName);
-    if (!entry?.serverUrl || entry.serverUrl !== serverUrl) return undefined;
-    return entry;
+  getForUrl(mcpName: string, serverUrl: string) {
+    return Effect.runPromise(this.getForUrlEffect(mcpName, serverUrl));
+  }
+
+  /** Effect-native URL-scoped auth lookup. */
+  getForUrlEffect(mcpName: string, serverUrl: string) {
+    return this.getEffect(mcpName).pipe(
+      Effect.map((entry) => (!entry?.serverUrl || entry.serverUrl !== serverUrl ? undefined : entry)),
+    );
   }
 
   /** Replaces the auth entry for one MCP server. */
@@ -183,19 +196,27 @@ export class AuthStore {
     return entry.tokens.expiresAt < Date.now() / 1000 ? "expired" : "authenticated";
   }
 
-  private async updateEntry(
+  private updateEntry(
     mcpName: string,
     update: (entry: AuthEntry) => AuthEntry,
     fence?: AuthWriteFence,
   ): Promise<void> {
-    await this.mutate((data) => {
+    return Effect.runPromise(this.updateEntryEffect(mcpName, update, fence));
+  }
+
+  private updateEntryEffect(mcpName: string, update: (entry: AuthEntry) => AuthEntry, fence?: AuthWriteFence) {
+    return this.mutateEffect((data) => {
       if (fence && this.activeWriteFences.get(mcpName) !== fence) return data;
       return { ...data, [mcpName]: update(data[mcpName] ?? {}) };
     });
   }
 
-  private async clearField(mcpName: string, field: keyof AuthEntry, fence?: AuthWriteFence): Promise<void> {
-    await this.mutate((data) => {
+  private clearField(mcpName: string, field: keyof AuthEntry, fence?: AuthWriteFence): Promise<void> {
+    return Effect.runPromise(this.clearFieldEffect(mcpName, field, fence));
+  }
+
+  private clearFieldEffect(mcpName: string, field: keyof AuthEntry, fence?: AuthWriteFence) {
+    return this.mutateEffect((data) => {
       if (fence && this.activeWriteFences.get(mcpName) !== fence) return data;
       const entry = data[mcpName];
       if (!entry) return data;
@@ -204,69 +225,61 @@ export class AuthStore {
   }
 
   private mutate(update: (data: AuthData) => AuthData): Promise<void> {
-    return this.withLock(async () => {
-      await withInterprocessLock(this.filepath, async () => {
-        await this.write(update(await this.read()));
-      });
-    });
+    return Effect.runPromise(this.mutateEffect(update));
   }
 
-  private withLock<T>(operation: () => Promise<T>): Promise<T> {
-    return Effect.runPromise(
-      this.mutex.withPermits(1)(
-        Effect.tryPromise({
-          try: operation,
-          catch: (error) => error,
+  private mutateEffect(update: (data: AuthData) => AuthData) {
+    const self = this;
+    return this.mutex.withPermits(1)(
+      withInterprocessLockEffect(
+        this.filepath,
+        Effect.gen(function* () {
+          yield* self.writeEffect(update(yield* self.readEffect()));
         }),
       ),
     );
   }
 
-  private read(): Promise<AuthData> {
+  private readEffect() {
     const filepath = this.filepath;
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        if (!existsSync(filepath)) return {};
-        const parsed = JSON.parse(yield* Effect.tryPromise({ try: () => readFile(filepath, "utf8"), catch: (error) => error }));
-        const result = parseAuthData(parsed);
-        if (result.rejected > 0) {
-          warnAuthStore(`ignored ${result.rejected} malformed persisted auth ${result.rejected === 1 ? "entry" : "entries"}`);
-        }
-        return result.data;
-      }).pipe(
-        Effect.catch((error) => {
-          warnAuthStore(`ignored unreadable persisted auth store: ${safeAuthStoreError(error)}`);
-          return Effect.succeed<AuthData>({});
-        }),
-      ),
+    return Effect.gen(function* () {
+      if (!existsSync(filepath)) return {};
+      const parsed = JSON.parse(yield* Effect.tryPromise({ try: () => readFile(filepath, "utf8"), catch: (error) => error }));
+      const result = parseAuthData(parsed);
+      if (result.rejected > 0) {
+        warnAuthStore(`ignored ${result.rejected} malformed persisted auth ${result.rejected === 1 ? "entry" : "entries"}`);
+      }
+      return result.data;
+    }).pipe(
+      Effect.catch((error) => {
+        warnAuthStore(`ignored unreadable persisted auth store: ${safeAuthStoreError(error)}`);
+        return Effect.succeed<AuthData>({});
+      }),
     );
   }
 
-  private write(data: AuthData): Promise<void> {
+  private writeEffect(data: AuthData) {
     const filepath = this.filepath;
     const tmp = `${filepath}.${process.pid}.${randomUUID()}.tmp`;
     const cleanup = Effect.tryPromise({
       try: () => unlink(tmp),
       catch: (error: unknown) => (isFileNotFoundError(error) ? undefined : error),
     }).pipe(Effect.ignore);
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        yield* Effect.tryPromise({ try: () => mkdir(path.dirname(filepath), { recursive: true }), catch: (error) => error });
-        yield* Effect.tryPromise({ try: () => writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 }), catch: (error) => error });
-        yield* Effect.tryPromise({ try: () => rename(tmp, filepath), catch: (error) => error });
-        yield* Effect.tryPromise({ try: () => chmod(filepath, 0o600), catch: (error) => error });
-      }).pipe(Effect.ensuring(cleanup)),
-    );
+    return Effect.gen(function* () {
+      yield* Effect.tryPromise({ try: () => mkdir(path.dirname(filepath), { recursive: true }), catch: (error) => error });
+      yield* Effect.tryPromise({ try: () => writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 }), catch: (error) => error });
+      yield* Effect.tryPromise({ try: () => rename(tmp, filepath), catch: (error) => error });
+      yield* Effect.tryPromise({ try: () => chmod(filepath, 0o600), catch: (error) => error });
+    }).pipe(Effect.ensuring(cleanup));
   }
 }
 
-async function withInterprocessLock<T>(target: string, operation: () => Promise<T>): Promise<T> {
-  const release = await acquireInterprocessLock(target);
-  try {
-    return await operation();
-  } finally {
-    await release();
-  }
+function withInterprocessLockEffect<A, E, R>(target: string, operation: Effect.Effect<A, E, R>) {
+  return Effect.acquireUseRelease(
+    Effect.tryPromise({ try: () => acquireInterprocessLock(target), catch: (error) => error }),
+    () => operation,
+    (release) => Effect.tryPromise({ try: () => release(), catch: () => undefined }).pipe(Effect.ignore),
+  );
 }
 
 async function acquireInterprocessLock(target: string): Promise<() => Promise<void>> {
