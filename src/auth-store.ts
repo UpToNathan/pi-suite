@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { Effect, Semaphore } from "effect";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -37,7 +38,7 @@ export interface AuthRefreshLock {
 /** Persists OAuth client metadata, tokens, and in-flight PKCE state for MCP servers. */
 export class AuthStore {
   private filepath: string;
-  private queue = Promise.resolve();
+  private readonly mutex = Semaphore.makeUnsafe(1);
   private readonly activeWriteFences = new Map<string, AuthWriteFence>();
 
   /** Creates an auth store backed by the default Pi MCP auth file or a test-supplied path. */
@@ -211,12 +212,14 @@ export class AuthStore {
   }
 
   private withLock<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(operation, operation);
-    this.queue = next.then(
-      () => undefined,
-      () => undefined,
+    return Effect.runPromise(
+      this.mutex.withPermits(1)(
+        Effect.tryPromise({
+          try: operation,
+          catch: (error) => error,
+        }),
+      ),
     );
-    return next;
   }
 
   private async read(): Promise<AuthData> {
