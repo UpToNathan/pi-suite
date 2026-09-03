@@ -27,7 +27,11 @@ export function paginate<T, R extends { nextCursor?: string | undefined }>(
   return Effect.runPromise(paginateEffect(list, items));
 }
 
-function paginateEffect<T, R extends { nextCursor?: string | undefined }>(
+/** Effect-native pagination with duplicate-cursor and page-limit protection.
+ * @template T Item type accumulated from each page.
+ * @template R Page result shape containing an optional cursor.
+ */
+export function paginateEffect<T, R extends { nextCursor?: string | undefined }>(
   list: (cursor?: string) => Promise<R>,
   items: (result: R) => T[],
 ) {
@@ -51,33 +55,44 @@ function paginateEffect<T, R extends { nextCursor?: string | undefined }>(
 
 /** Lists tools from an MCP client while rejecting cursor loops. */
 export function listTools(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Tool[]> {
-  return Effect.runPromise(
-    paginateEffect(
-      (cursor) => client.listTools(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
-      (result) => result.tools,
-    ),
+  return Effect.runPromise(listToolsEffect(client, timeout, signal));
+}
+
+/** Effect-native MCP tool listing. */
+export function listToolsEffect(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined) {
+  return paginateEffect(
+    (cursor) => client.listTools(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
+    (result) => result.tools,
   );
 }
 
 /** Lists prompts from an MCP client when the server advertises prompt support. */
 export function listPrompts(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Prompt[]> {
   if (!client.getServerCapabilities()?.prompts) return Promise.resolve([]);
-  return Effect.runPromise(
-    paginateEffect(
-      (cursor) => client.listPrompts(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
-      (result) => result.prompts,
-    ),
+  return Effect.runPromise(listPromptsEffect(client, timeout, signal));
+}
+
+/** Effect-native MCP prompt listing. */
+export function listPromptsEffect(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined) {
+  if (!client.getServerCapabilities()?.prompts) return Effect.succeed<Prompt[]>([]);
+  return paginateEffect(
+    (cursor) => client.listPrompts(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
+    (result) => result.prompts,
   );
 }
 
 /** Lists resources from an MCP client when the server advertises resource support. */
 export function listResources(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined): Promise<Resource[]> {
   if (!client.getServerCapabilities()?.resources) return Promise.resolve([]);
-  return Effect.runPromise(
-    paginateEffect(
-      (cursor) => client.listResources(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
-      (result) => result.resources,
-    ),
+  return Effect.runPromise(listResourcesEffect(client, timeout, signal));
+}
+
+/** Effect-native MCP resource listing. */
+export function listResourcesEffect(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined) {
+  if (!client.getServerCapabilities()?.resources) return Effect.succeed<Resource[]>([]);
+  return paginateEffect(
+    (cursor) => client.listResources(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
+    (result) => result.resources,
   );
 }
 

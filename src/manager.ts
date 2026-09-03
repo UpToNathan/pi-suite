@@ -23,7 +23,7 @@ import { randomHex } from "./random.js";
 import { DEFAULT_TIMEOUT } from "./request-limits.js";
 import { mcpToolKey, sanitizeName } from "./tool-names.js";
 import { withTimeoutEffect } from "./timeout.js";
-import { listPrompts, listResources, listTools } from "./catalog.js";
+import { listPromptsEffect, listResourcesEffect, listTools } from "./catalog.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
 import {
   NodeOAuthCallbackRuntime,
@@ -119,30 +119,37 @@ export class McpManager {
   }
 
   /** Replaces the active MCP configuration and runs the caller-selected startup operation. */
-  async initialize(config: McpConfig, options: McpInitializeOptions): Promise<void> {
-    this.closed = false;
-    this.revision += 1;
-    this.deactivateOAuthProviders();
-    await this.oauthCallbacks.close();
-    await this.closePendingOAuthTransports();
-    await this.closeClients();
-    this.connectionAttempts.clear();
-    this.statuses.clear();
-    this.config = cloneMcpConfig(config);
+  initialize(config: McpConfig, options: McpInitializeOptions): Promise<void> {
+    return Effect.runPromise(this.initializeEffect(config, options));
+  }
 
-    for (const [name, serverConfig] of Object.entries(this.config.servers)) {
-      this.statuses.set(name, isConfigDisabled(serverConfig) ? { status: "disabled" } : { status: "disconnected" });
-    }
+  /** Effect-native manager initialization. */
+  initializeEffect(config: McpConfig, options: McpInitializeOptions) {
+    const self = this;
+    return Effect.gen(function* () {
+      self.closed = false;
+      self.revision += 1;
+      self.deactivateOAuthProviders();
+      yield* self.oauthCallbacks.closeEffect();
+      yield* self.closePendingOAuthTransportsEffect();
+      yield* self.closeClientsEffect();
+      self.connectionAttempts.clear();
+      self.statuses.clear();
+      self.config = cloneMcpConfig(config);
 
-    if (options.mode === "connect") {
-      await this.connectAll({
-        intent: options.intent,
-        signal: options.signal,
-      });
-      return;
-    }
+      for (const [name, serverConfig] of Object.entries(self.config.servers)) {
+        self.statuses.set(name, isConfigDisabled(serverConfig) ? { status: "disabled" } : { status: "disconnected" });
+      }
 
-    await this.emitStatusChanged();
+      if (options.mode === "connect") {
+        yield* Effect.tryPromise({
+          try: () => self.connectAll({ intent: options.intent, signal: options.signal }),
+          catch: (error) => error,
+        });
+        return;
+      }
+      yield* self.emitStatusChangedEffect();
+    });
   }
 
   /** Connects every eligible configured MCP server in parallel and returns the latest status snapshot. */
@@ -308,57 +315,84 @@ export class McpManager {
   }
 
   /** Lists resources exposed by connected MCP servers, optionally restricted to one server. */
-  async resources(server: string | undefined, options: CancellableOptions): Promise<McpResourcesResult> {
+  resources(server: string | undefined, options: CancellableOptions): Promise<McpResourcesResult> {
+    return Effect.runPromise(this.resourcesEffect(server, options));
+  }
+
+  /** Effect-native resource listing. */
+  resourcesEffect(server: string | undefined, options: CancellableOptions) {
     const targets = Array.from(this.clients).filter(([name, managed]) => {
       if (server && name !== server) return false;
       return !!managed.client.getServerCapabilities()?.resources;
     });
     if (server) {
       const managed = targets[0]?.[1];
-      if (!managed) return { resources: [], failures: [] };
-      const resources = await listResources(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal);
-      return { resources: resources.map((resource) => ({ ...resource, client: server })), failures: [] };
+      if (!managed) return Effect.succeed<McpResourcesResult>({ resources: [], failures: [] });
+      return listResourcesEffect(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal).pipe(
+        Effect.map((resources): McpResourcesResult => ({ resources: resources.map((resource) => ({ ...resource, client: server })), failures: [] })),
+      );
     }
-    const collected = await collectPartial(targets, options.signal, async (name, managed) => {
-      const resources = await listResources(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal);
-      return resources.map((resource) => ({ ...resource, client: name }));
-    });
-    return { resources: collected.items, failures: collected.failures };
+    return collectPartialEffect(targets, options.signal, (name, managed) =>
+      listResourcesEffect(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal).pipe(
+        Effect.map((resources) => resources.map((resource) => ({ ...resource, client: name }))),
+      ),
+    ).pipe(Effect.map((collected): McpResourcesResult => ({ resources: collected.items, failures: collected.failures })));
   }
 
   /** Lists prompts exposed by every connected MCP server. */
-  async prompts(options: CancellableOptions): Promise<McpPromptsResult> {
+  prompts(options: CancellableOptions): Promise<McpPromptsResult> {
+    return Effect.runPromise(this.promptsEffect(options));
+  }
+
+  /** Effect-native prompt listing. */
+  promptsEffect(options: CancellableOptions) {
     const targets = Array.from(this.clients).filter(([, managed]) => !!managed.client.getServerCapabilities()?.prompts);
-    const collected = await collectPartial(targets, options.signal, async (name, managed) => {
-      const prompts = await listPrompts(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal);
-      return prompts.map((prompt) => ({
-        ...prompt,
-        client: name,
-        commandName: `${sanitizeName(name)}:${sanitizeName(prompt.name)}`,
-      }));
-    });
-    return { prompts: collected.items, failures: collected.failures };
+    return collectPartialEffect(targets, options.signal, (name, managed) =>
+      listPromptsEffect(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal).pipe(
+        Effect.map((prompts) => prompts.map((prompt) => ({
+          ...prompt,
+          client: name,
+          commandName: `${sanitizeName(name)}:${sanitizeName(prompt.name)}`,
+        }))),
+      ),
+    ).pipe(Effect.map((collected): McpPromptsResult => ({ prompts: collected.items, failures: collected.failures })));
   }
 
   /** Fetches one prompt from a connected MCP server. */
-  async getPrompt(clientName: string, name: string, args: Record<string, string> | undefined, options: CancellableOptions) {
+  getPrompt(clientName: string, name: string, args: Record<string, string> | undefined, options: CancellableOptions) {
+    return Effect.runPromise(this.getPromptEffect(clientName, name, args, options));
+  }
+
+  /** Effect-native prompt fetch. */
+  getPromptEffect(clientName: string, name: string, args: Record<string, string> | undefined, options: CancellableOptions) {
     const managed = this.clients.get(clientName);
-    if (!managed) throw new Error(`MCP server "${clientName}" is not connected`);
-    return managed.client.getPrompt(
-      { name, arguments: args },
-      sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal),
-    );
+    if (!managed) return Effect.fail(new Error(`MCP server "${clientName}" is not connected`));
+    return Effect.tryPromise({
+      try: () => managed.client.getPrompt(
+        { name, arguments: args },
+        sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal),
+      ),
+      catch: (error) => error,
+    });
   }
 
   /** Reads one resource from a connected MCP server. */
-  async readResource(clientName: string, uri: string, options: CancellableOptions) {
+  readResource(clientName: string, uri: string, options: CancellableOptions) {
+    return Effect.runPromise(this.readResourceEffect(clientName, uri, options));
+  }
+
+  /** Effect-native resource read. */
+  readResourceEffect(clientName: string, uri: string, options: CancellableOptions) {
     const managed = this.clients.get(clientName);
-    if (!managed) throw new Error(`MCP server "${clientName}" is not connected`);
-    if (!managed.client.getServerCapabilities()?.resources) throw new Error(`MCP server "${clientName}" does not support resources`);
-    return managed.client.readResource(
-      { uri },
-      sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal),
-    );
+    if (!managed) return Effect.fail(new Error(`MCP server "${clientName}" is not connected`));
+    if (!managed.client.getServerCapabilities()?.resources) return Effect.fail(new Error(`MCP server "${clientName}" does not support resources`));
+    return Effect.tryPromise({
+      try: () => managed.client.readResource(
+        { uri },
+        sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal),
+      ),
+      catch: (error) => error,
+    });
   }
 
   /** Reports whether any connected MCP server currently supports resources. */
@@ -414,14 +448,22 @@ export class McpManager {
   }
 
   /** Closes all connected MCP clients and any local OAuth callback listener. */
-  async close(): Promise<void> {
-    this.closed = true;
-    this.revision += 1;
-    this.deactivateOAuthProviders();
-    await this.oauthCallbacks.close();
-    await this.closePendingOAuthTransports();
-    await this.closeClients();
-    this.connectionAttempts.clear();
+  close(): Promise<void> {
+    return Effect.runPromise(this.closeEffect());
+  }
+
+  /** Effect-native manager shutdown. */
+  closeEffect() {
+    const self = this;
+    return Effect.gen(function* () {
+      self.closed = true;
+      self.revision += 1;
+      self.deactivateOAuthProviders();
+      yield* self.oauthCallbacks.closeEffect();
+      yield* self.closePendingOAuthTransportsEffect();
+      yield* self.closeClientsEffect();
+      self.connectionAttempts.clear();
+    });
   }
 
   private async connectFresh(
@@ -827,31 +869,34 @@ export class McpManager {
     if (managed) await safeCloseClient(managed.client, managed.transport);
   }
 
-  private async closePendingOAuthTransports(): Promise<void> {
+  private closePendingOAuthTransportsEffect() {
     const transports = Array.from(this.pendingOAuthTransports.values());
     this.pendingOAuthTransports.clear();
-    await Effect.runPromise(
-      Effect.forEach(transports, (transport) => safeCloseTransportEffect(transport), {
-        concurrency: "unbounded",
-        discard: true,
-      }),
-    );
+    return Effect.forEach(transports, (transport) => safeCloseTransportEffect(transport), {
+      concurrency: "unbounded",
+      discard: true,
+    });
   }
 
-  private async closeClients() {
+  private closeClientsEffect() {
     const clients = Array.from(this.clients.values());
     this.clients.clear();
-    await Effect.runPromise(
-      Effect.forEach(
-        clients,
-        (managed) => safeCloseClientEffect(managed.client, managed.transport),
-        { concurrency: "unbounded", discard: true },
-      ),
+    return Effect.forEach(
+      clients,
+      (managed) => safeCloseClientEffect(managed.client, managed.transport),
+      { concurrency: "unbounded", discard: true },
     );
   }
 
-  private async emitStatusChanged() {
-    await this.options.onStatusChanged?.();
+  private emitStatusChanged() {
+    return Effect.runPromise(this.emitStatusChangedEffect());
+  }
+
+  private emitStatusChangedEffect() {
+    return Effect.tryPromise({
+      try: () => Promise.resolve(this.options.onStatusChanged?.()),
+      catch: (error) => error,
+    });
   }
 
   private isCurrentRevision(revision: number) {
@@ -1035,37 +1080,35 @@ function sdkRequestOptions(timeout: number, signal: AbortSignal | undefined) {
   };
 }
 
-async function collectPartial<T>(
+function collectPartialEffect<T, E, R>(
   targets: Array<[string, ManagedClient]>,
   signal: AbortSignal | undefined,
-  list: (name: string, managed: ManagedClient) => Promise<T[]>,
+  list: (name: string, managed: ManagedClient) => Effect.Effect<T[], E, R>,
 ) {
-  signal?.throwIfAborted();
-  const settled = await Effect.runPromise(
-    Effect.all(
-      targets.map(([name, managed]) =>
-        Effect.tryPromise({
-          try: async () => ({ name, items: await list(name, managed) }),
-          catch: (reason) => reason,
-        }),
+  return Effect.sync(() => signal?.throwIfAborted()).pipe(
+    Effect.andThen(
+      Effect.all(
+        targets.map(([name, managed]) => list(name, managed).pipe(Effect.map((items) => ({ name, items })))),
+        { concurrency: "unbounded", mode: "result" },
       ),
-      { concurrency: "unbounded", mode: "result" },
     ),
+    Effect.map((settled) => {
+      const items: T[] = [];
+      const failures: McpServerFailure[] = [];
+      for (let index = 0; index < settled.length; index++) {
+        const result = settled[index];
+        const target = targets[index];
+        if (!result || !target) continue;
+        if (result._tag === "Success") {
+          items.push(...result.success.items);
+          continue;
+        }
+        if (isAbortError(result.failure)) throw result.failure;
+        failures.push({ server: target[0], error: safeErrorSummary(result.failure) });
+      }
+      return { items, failures };
+    }),
   );
-  const items: T[] = [];
-  const failures: McpServerFailure[] = [];
-  for (let index = 0; index < settled.length; index++) {
-    const result = settled[index];
-    const target = targets[index];
-    if (!result || !target) continue;
-    if (result._tag === "Success") {
-      items.push(...result.success.items);
-      continue;
-    }
-    if (isAbortError(result.failure)) throw result.failure;
-    failures.push({ server: target[0], error: safeErrorSummary(result.failure) });
-  }
-  return { items, failures };
 }
 
 function isAbortError(error: unknown) {

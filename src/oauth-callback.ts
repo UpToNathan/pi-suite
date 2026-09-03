@@ -9,21 +9,25 @@ export type OAuthCallbackResult = URLSearchParams;
 
 /** Owns one manager's OAuth callback listener and pending browser flows. */
 export interface OAuthCallbackRuntime {
+  /** Effect-native startup of the loopback callback listener. */
+  startEffect(redirectUri?: string): Effect.Effect<void, Error>;
   /** Starts the loopback callback listener for the configured redirect URI. */
   start(redirectUri?: string): Promise<void>;
+  /** Effect-native wait for one OAuth callback. */
+  waitForResultEffect(server: string, state: string): Effect.Effect<OAuthCallbackResult, Error>;
   /** Waits for a callback matching one server and state value. */
   waitForResult(server: string, state: string): Promise<OAuthCallbackResult>;
   /** Cancels the pending callback for one MCP server. */
   cancel(server: string): void;
+  /** Effect-native listener shutdown. */
+  closeEffect(): Effect.Effect<void, never>;
   /** Closes the listener and rejects all pending callback waits. */
   close(): Promise<void>;
 }
 
 type PendingAuth = {
   readonly server: string;
-  readonly resolve: (result: OAuthCallbackResult) => void;
-  readonly reject: (error: Error) => void;
-  readonly timeout: ReturnType<typeof setTimeout>;
+  readonly resume: (effect: Effect.Effect<OAuthCallbackResult, Error>) => void;
 };
 
 /** Node loopback implementation of the manager-owned OAuth callback runtime. */
@@ -39,7 +43,8 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
     return Effect.runPromise(this.startEffect(redirectUri));
   }
 
-  private startEffect(redirectUri?: string) {
+  /** Effect-native callback listener startup. */
+  startEffect(redirectUri?: string) {
     const self = this;
     return Effect.gen(function* () {
       const { port, path } = parseRedirectUri(redirectUri);
@@ -61,17 +66,27 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
 
   /** Waits for callback parameters whose state belongs to the named MCP server. */
   waitForResult(server: string, state: string): Promise<OAuthCallbackResult> {
-    this.stateByServer.set(server, state);
-    return new Promise<OAuthCallbackResult>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        const pending = this.pendingByState.get(state);
+    return Effect.runPromise(this.waitForResultEffect(server, state));
+  }
+
+  /** Effect-native wait for callback parameters. */
+  waitForResultEffect(server: string, state: string) {
+    const self = this;
+    return Effect.callback<OAuthCallbackResult, Error>((resume) => {
+      self.stateByServer.set(server, state);
+      self.pendingByState.set(state, { server, resume });
+      return Effect.sync(() => {
+        const pending = self.pendingByState.get(state);
         if (!pending) return;
-        this.removePending(state, pending);
-        pending.reject(new Error("OAuth callback timeout - authorization took too long"));
-        this.stopIfIdle();
-      }, CALLBACK_TIMEOUT_MS);
-      this.pendingByState.set(state, { server, resolve, reject, timeout });
-    });
+        self.removePending(state, pending);
+        self.stopIfIdle();
+      });
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: CALLBACK_TIMEOUT_MS,
+        orElse: () => Effect.fail(new Error("OAuth callback timeout - authorization took too long")),
+      }),
+    );
   }
 
   /** Cancels one server's pending callback without affecting another manager or server. */
@@ -81,7 +96,7 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
     const pending = this.pendingByState.get(state);
     if (!pending) return;
     this.removePending(state, pending);
-    pending.reject(new Error("Authorization cancelled"));
+    pending.resume(Effect.fail(new Error("Authorization cancelled")));
     this.stopIfIdle();
   }
 
@@ -90,7 +105,8 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
     return Effect.runPromise(this.closeEffect());
   }
 
-  private closeEffect() {
+  /** Effect-native callback listener shutdown. */
+  closeEffect() {
     const self = this;
     return Effect.gen(function* () {
       const activeServer = self.server;
@@ -102,7 +118,7 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
       }
       for (const [state, pending] of self.pendingByState) {
         self.removePending(state, pending);
-        pending.reject(new Error("OAuth callback server stopped"));
+        pending.resume(Effect.fail(new Error("OAuth callback server stopped")));
       }
     });
   }
@@ -126,7 +142,7 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
     }
     if (url.searchParams.has("error")) {
       this.removePending(state, pending);
-      pending.reject(new Error("OAuth authorization server returned an error"));
+      pending.resume(Effect.fail(new Error("OAuth authorization server returned an error")));
       sendHtml(response, 200, errorPage("The authorization server did not approve this request."));
       this.stopIfIdle();
       return;
@@ -137,13 +153,12 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
     }
 
     this.removePending(state, pending);
-    pending.resolve(new URLSearchParams(url.searchParams));
+    pending.resume(Effect.succeed(new URLSearchParams(url.searchParams)));
     sendHtml(response, 200, successPage());
     this.stopIfIdle();
   }
 
   private removePending(state: string, pending: PendingAuth): void {
-    clearTimeout(pending.timeout);
     this.pendingByState.delete(state);
     if (this.stateByServer.get(pending.server) === state) this.stateByServer.delete(pending.server);
   }
