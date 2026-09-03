@@ -181,25 +181,33 @@ async function runMcpPrompt(
   return true;
 }
 
-async function collectPromptArguments(
+function collectPromptArguments(
   ctx: ExtensionCommandContext,
   prompt: Prompt,
 ): Promise<Record<string, string> | undefined> {
-  const values: Record<string, string> = {};
-  for (const argument of prompt.arguments ?? []) {
-    const value = await ctx.ui.input(
-      `${prompt.name} — ${argument.name}${argument.required ? " (required)" : ""}`,
-      argument.description ?? (argument.required ? "required" : "optional; leave blank to omit"),
-    );
-    if (value === undefined) return undefined;
-    const trimmed = value.trim();
-    if (trimmed.length > 0) values[argument.name] = trimmed;
-    else if (argument.required) {
-      ctx.ui.notify(`MCP prompt argument ${argument.name} is required`, "warning");
-      return undefined;
-    }
-  }
-  return values;
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const values: Record<string, string> = {};
+      for (const argument of prompt.arguments ?? []) {
+        const value = yield* Effect.tryPromise({
+          try: () =>
+            ctx.ui.input(
+              `${prompt.name} — ${argument.name}${argument.required ? " (required)" : ""}`,
+              argument.description ?? (argument.required ? "required" : "optional; leave blank to omit"),
+            ),
+          catch: (error) => error,
+        });
+        if (value === undefined) return undefined;
+        const trimmed = value.trim();
+        if (trimmed.length > 0) values[argument.name] = trimmed;
+        else if (argument.required) {
+          ctx.ui.notify(`MCP prompt argument ${argument.name} is required`, "warning");
+          return undefined;
+        }
+      }
+      return values;
+    }),
+  );
 }
 
 function formatPromptChoice(prompt: Prompt): string {
