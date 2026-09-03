@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { Effect } from "effect";
 import { OAUTH_CALLBACK_PATH, OAUTH_CALLBACK_PORT, parseRedirectUri } from "./oauth-provider.js";
 
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -34,21 +35,28 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
   private readonly stateByServer = new Map<string, string>();
 
   /** Starts the callback listener and fails when its loopback port is unavailable. */
-  async start(redirectUri?: string): Promise<void> {
-    const { port, path } = parseRedirectUri(redirectUri);
-    if (this.server && (this.currentPort !== port || this.currentPath !== path)) await this.close();
-    if (this.server) return;
+  start(redirectUri?: string): Promise<void> {
+    return Effect.runPromise(this.startEffect(redirectUri));
+  }
 
-    this.currentPort = port;
-    this.currentPath = path;
-    const nextServer = createServer((request, response) => this.handleRequest(request, response));
-    await new Promise<void>((resolve, reject) => {
-      nextServer.once("error", (error) => {
-        reject(new Error(`OAuth callback server could not listen on 127.0.0.1:${port}: ${error.message}`));
+  private startEffect(redirectUri?: string) {
+    const self = this;
+    return Effect.gen(function* () {
+      const { port, path } = parseRedirectUri(redirectUri);
+      if (self.server && (self.currentPort !== port || self.currentPath !== path)) yield* self.closeEffect();
+      if (self.server) return;
+
+      self.currentPort = port;
+      self.currentPath = path;
+      const nextServer = createServer((request, response) => self.handleRequest(request, response));
+      yield* Effect.callback<void, Error>((resume) => {
+        nextServer.once("error", (error) =>
+          resume(Effect.fail(new Error(`OAuth callback server could not listen on 127.0.0.1:${port}: ${error.message}`))),
+        );
+        nextServer.listen(port, "127.0.0.1", () => resume(Effect.succeed(undefined)));
       });
-      nextServer.listen(port, "127.0.0.1", resolve);
+      self.server = nextServer;
     });
-    this.server = nextServer;
   }
 
   /** Waits for callback parameters whose state belongs to the named MCP server. */
@@ -78,14 +86,25 @@ export class NodeOAuthCallbackRuntime implements OAuthCallbackRuntime {
   }
 
   /** Closes this runtime and rejects all callback waits it owns. */
-  async close(): Promise<void> {
-    const activeServer = this.server;
-    this.server = undefined;
-    if (activeServer) await new Promise<void>((resolve) => activeServer.close(() => resolve()));
-    for (const [state, pending] of this.pendingByState) {
-      this.removePending(state, pending);
-      pending.reject(new Error("OAuth callback server stopped"));
-    }
+  close(): Promise<void> {
+    return Effect.runPromise(this.closeEffect());
+  }
+
+  private closeEffect() {
+    const self = this;
+    return Effect.gen(function* () {
+      const activeServer = self.server;
+      self.server = undefined;
+      if (activeServer) {
+        yield* Effect.callback<void, never>((resume) => {
+          activeServer.close(() => resume(Effect.succeed(undefined)));
+        });
+      }
+      for (const [state, pending] of self.pendingByState) {
+        self.removePending(state, pending);
+        pending.reject(new Error("OAuth callback server stopped"));
+      }
+    });
   }
 
   private handleRequest(request: IncomingMessage, response: ServerResponse): void {
