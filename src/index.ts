@@ -619,15 +619,25 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     if (startupMode(config) === "eager") startBackgroundConnectionRefresh(ctx, loaded.activeManager, loaded.generation);
   });
 
-  pi.on("session_shutdown", async () => {
-    configGeneration += 1;
-    const pendingConnectionRefresh = backgroundConnectionRefresh;
-    backgroundConnectionRefresh = undefined;
-    await manager?.close();
-    if (pendingConnectionRefresh) await Promise.race([pendingConnectionRefresh, Promise.resolve()]);
-    manager = undefined;
-    registeredToolNames = new Set();
-  });
+  pi.on("session_shutdown", () =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        configGeneration += 1;
+        const pendingConnectionRefresh = backgroundConnectionRefresh;
+        const activeManager = manager;
+        backgroundConnectionRefresh = undefined;
+        if (activeManager) yield* Effect.tryPromise({ try: () => activeManager.close(), catch: (error) => error });
+        if (pendingConnectionRefresh) {
+          yield* Effect.race(
+            Effect.tryPromise({ try: () => pendingConnectionRefresh, catch: (error) => error }),
+            Effect.succeed(undefined),
+          );
+        }
+        manager = undefined;
+        registeredToolNames = new Set();
+      }),
+    ),
+  );
 
   pi.registerCommand("mcp", {
     description: "Open the interactive MCP server manager",
