@@ -6,6 +6,7 @@ import type {
   StoredOAuthClientInformation,
   StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
+import { Effect, Semaphore } from "effect";
 import type { AuthClientInfo, AuthDiscoveryState, AuthTokens, OAuthConfig } from "./types.js";
 import { AuthStore, type AuthRefreshLock, type AuthWriteFence } from "./auth-store.js";
 import { randomHex } from "./random.js";
@@ -27,7 +28,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private active = true;
   private readonly writeFence: AuthWriteFence;
   private refreshLock: AuthRefreshLock | undefined;
-  private refreshLockAcquisition: Promise<AuthRefreshLock> | undefined;
+  private readonly refreshMutex = Semaphore.makeUnsafe(1);
   private refreshLockTimeout: NodeJS.Timeout | undefined;
 
   /** Creates an OAuth provider for one remote MCP server and its persisted auth state. */
@@ -62,45 +63,47 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   /** Returns saved static or dynamically registered OAuth client information. */
-  async clientInformation(ctx?: OAuthClientInformationContext): Promise<StoredOAuthClientInformation | undefined> {
-    if (this.config?.clientId) {
-      const entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
-      if (ctx?.issuer && entry?.clientInfo?.configuredClient && entry.clientInfo.issuer !== ctx.issuer) return undefined;
-      if (ctx?.issuer && !entry?.clientInfo?.configuredClient && this.active) {
-        await this.auth.updateClientInfo(
-          this.mcpName,
-          { clientId: this.config.clientId, issuer: ctx.issuer, configuredClient: true },
-          this.serverUrl,
-          this.writeFence,
-        );
-      }
-      return {
-        client_id: this.config.clientId,
-        ...(this.config.clientSecret !== undefined ? { client_secret: this.config.clientSecret } : {}),
-        ...(ctx?.issuer ? { issuer: ctx.issuer } : {}),
-      };
-    }
+  clientInformation(ctx?: OAuthClientInformationContext): Promise<StoredOAuthClientInformation | undefined> {
+    const self = this;
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        if (self.config?.clientId) {
+          const entry = yield* self.auth.getForUrlEffect(self.mcpName, self.serverUrl);
+          if (ctx?.issuer && entry?.clientInfo?.configuredClient && entry.clientInfo.issuer !== ctx.issuer) return undefined;
+          if (ctx?.issuer && !entry?.clientInfo?.configuredClient && self.active) {
+            yield* self.auth.updateClientInfoEffect(
+              self.mcpName,
+              { clientId: self.config.clientId, issuer: ctx.issuer, configuredClient: true },
+              self.serverUrl,
+              self.writeFence,
+            );
+          }
+          return {
+            client_id: self.config.clientId,
+            ...(self.config.clientSecret !== undefined ? { client_secret: self.config.clientSecret } : {}),
+            ...(ctx?.issuer ? { issuer: ctx.issuer } : {}),
+          };
+        }
 
-    const entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
-    if (!entry?.clientInfo || (ctx?.issuer && entry.clientInfo.issuer !== ctx.issuer)) return undefined;
-    if (entry.clientInfo.clientSecretExpiresAt && entry.clientInfo.clientSecretExpiresAt < Date.now() / 1000) {
-      return undefined;
-    }
-
-    return {
-      client_id: entry.clientInfo.clientId,
-      ...(entry.clientInfo.clientSecret !== undefined ? { client_secret: entry.clientInfo.clientSecret } : {}),
-      ...(entry.clientInfo.clientIdIssuedAt !== undefined ? { client_id_issued_at: entry.clientInfo.clientIdIssuedAt } : {}),
-      ...(entry.clientInfo.clientSecretExpiresAt !== undefined
-        ? { client_secret_expires_at: entry.clientInfo.clientSecretExpiresAt }
-        : {}),
-      ...(entry.clientInfo.issuer ? { issuer: entry.clientInfo.issuer } : {}),
-    };
+        const entry = yield* self.auth.getForUrlEffect(self.mcpName, self.serverUrl);
+        if (!entry?.clientInfo || (ctx?.issuer && entry.clientInfo.issuer !== ctx.issuer)) return undefined;
+        if (entry.clientInfo.clientSecretExpiresAt && entry.clientInfo.clientSecretExpiresAt < Date.now() / 1000) return undefined;
+        return {
+          client_id: entry.clientInfo.clientId,
+          ...(entry.clientInfo.clientSecret !== undefined ? { client_secret: entry.clientInfo.clientSecret } : {}),
+          ...(entry.clientInfo.clientIdIssuedAt !== undefined ? { client_id_issued_at: entry.clientInfo.clientIdIssuedAt } : {}),
+          ...(entry.clientInfo.clientSecretExpiresAt !== undefined
+            ? { client_secret_expires_at: entry.clientInfo.clientSecretExpiresAt }
+            : {}),
+          ...(entry.clientInfo.issuer ? { issuer: entry.clientInfo.issuer } : {}),
+        };
+      }),
+    );
   }
 
   /** Persists dynamically registered OAuth client information. */
-  async saveClientInformation(info: StoredOAuthClientInformation): Promise<void> {
-    if (!this.active) return;
+  saveClientInformation(info: StoredOAuthClientInformation): Promise<void> {
+    if (!this.active) return Promise.resolve();
     const configuredClient = info.client_id === this.config?.clientId;
     const clientInfo: AuthClientInfo = {
       clientId: info.client_id,
@@ -111,45 +114,45 @@ export class McpOAuthProvider implements OAuthClientProvider {
       ...(!configuredClient ? { redirectUris: [this.redirectUrl] } : {}),
       ...(configuredClient ? { configuredClient: true } : {}),
     };
-    await this.auth.updateClientInfo(
-      this.mcpName,
-      clientInfo,
-      this.serverUrl,
-      this.writeFence,
+    return Effect.runPromise(
+      this.auth.updateClientInfoEffect(this.mcpName, clientInfo, this.serverUrl, this.writeFence),
     );
   }
 
   /** Returns saved OAuth tokens in the shape expected by the MCP SDK. */
-  async tokens(ctx?: OAuthClientInformationContext): Promise<StoredOAuthTokens | undefined> {
-    let entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
-    if (!entry?.tokens || (ctx?.issuer && entry.tokens.issuer !== ctx.issuer)) return undefined;
+  tokens(ctx?: OAuthClientInformationContext): Promise<StoredOAuthTokens | undefined> {
+    const self = this;
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        let entry = yield* self.auth.getForUrlEffect(self.mcpName, self.serverUrl);
+        if (!entry?.tokens || (ctx?.issuer && entry.tokens.issuer !== ctx.issuer)) return undefined;
 
-    if (ctx?.issuer && entry.tokens.refreshToken) {
-      await this.acquireRefreshLock();
-      entry = await this.auth.getForUrl(this.mcpName, this.serverUrl);
-      if (!entry?.tokens || entry.tokens.issuer !== ctx.issuer) {
-        await this.releaseRefreshLock();
-        return undefined;
-      }
-    }
+        if (ctx?.issuer && entry.tokens.refreshToken) {
+          yield* self.acquireRefreshLockEffect();
+          entry = yield* self.auth.getForUrlEffect(self.mcpName, self.serverUrl);
+          if (!entry?.tokens || entry.tokens.issuer !== ctx.issuer) {
+            yield* self.releaseRefreshLockEffect();
+            return undefined;
+          }
+        }
 
-    const tokens: StoredOAuthTokens = {
-      access_token: entry.tokens.accessToken,
-      token_type: "Bearer",
-    };
-    if (entry.tokens.refreshToken !== undefined) tokens.refresh_token = entry.tokens.refreshToken;
-    if (entry.tokens.expiresAt !== undefined) tokens.expires_in = Math.max(0, Math.floor(entry.tokens.expiresAt - Date.now() / 1000));
-    if (entry.tokens.scope !== undefined) tokens.scope = entry.tokens.scope;
-    if (entry.tokens.issuer !== undefined) tokens.issuer = entry.tokens.issuer;
-    return tokens;
+        const tokens: StoredOAuthTokens = { access_token: entry.tokens.accessToken, token_type: "Bearer" };
+        if (entry.tokens.refreshToken !== undefined) tokens.refresh_token = entry.tokens.refreshToken;
+        if (entry.tokens.expiresAt !== undefined) tokens.expires_in = Math.max(0, Math.floor(entry.tokens.expiresAt - Date.now() / 1000));
+        if (entry.tokens.scope !== undefined) tokens.scope = entry.tokens.scope;
+        if (entry.tokens.issuer !== undefined) tokens.issuer = entry.tokens.issuer;
+        return tokens;
+      }),
+    );
   }
 
   /** Persists OAuth tokens returned by the MCP SDK after grant or refresh flows. */
-  async saveTokens(tokens: StoredOAuthTokens, ctx?: OAuthClientInformationContext): Promise<void> {
-    if (!this.active) return;
+  saveTokens(tokens: StoredOAuthTokens, ctx?: OAuthClientInformationContext): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    const self = this;
     let retainRefreshLock = false;
-    try {
-      const existing = await this.auth.getForUrl(this.mcpName, this.serverUrl);
+    const save = Effect.gen(function* () {
+      const existing = yield* self.auth.getForUrlEffect(self.mcpName, self.serverUrl);
       const authTokens: AuthTokens = {
         accessToken: tokens.access_token,
         ...(nonEmptyString(tokens.refresh_token) ? { refreshToken: tokens.refresh_token } : {}),
@@ -157,67 +160,90 @@ export class McpOAuthProvider implements OAuthClientProvider {
         ...(nonEmptyString(tokens.scope) ? { scope: tokens.scope } : {}),
         ...(nonEmptyString(tokens.issuer) ? { issuer: tokens.issuer } : {}),
       };
-      await this.auth.updateTokens(
-        this.mcpName,
-        authTokens,
-        this.serverUrl,
-        this.writeFence,
-      );
-      if (!this.active) return;
-      await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
+      yield* self.auth.updateTokensEffect(self.mcpName, authTokens, self.serverUrl, self.writeFence);
+      if (!self.active) return;
+      yield* self.auth.clearDiscoveryStateEffect(self.mcpName, self.writeFence);
       retainRefreshLock = isIssuerBackstamp(existing?.tokens, authTokens, ctx);
-    } finally {
-      if (!retainRefreshLock) await this.releaseRefreshLock();
-    }
+    });
+    return Effect.runPromise(
+      save.pipe(
+        Effect.ensuring(
+          Effect.suspend(() => (retainRefreshLock ? Effect.void : self.releaseRefreshLockEffect().pipe(Effect.ignore))),
+        ),
+      ),
+    );
   }
 
   /** Captures or opens the authorization URL supplied by the MCP SDK. */
-  async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
-    await this.releaseRefreshLock();
-    await this.callbacks.onRedirect(authorizationUrl);
+  redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    return Effect.runPromise(
+      this.releaseRefreshLockEffect().pipe(
+        Effect.andThen(
+          Effect.tryPromise({ try: () => Promise.resolve(this.callbacks.onRedirect(authorizationUrl)), catch: (error) => error }),
+        ),
+      ),
+    );
   }
 
   /** Persists the PKCE code verifier supplied by the MCP SDK. */
-  async saveCodeVerifier(codeVerifier: string): Promise<void> {
-    if (!this.active) return;
-    await this.auth.updateCodeVerifier(this.mcpName, codeVerifier, this.writeFence);
+  saveCodeVerifier(codeVerifier: string): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    return Effect.runPromise(this.auth.updateCodeVerifierEffect(this.mcpName, codeVerifier, this.writeFence));
   }
 
   /** Returns the PKCE code verifier for the current OAuth flow. */
-  async codeVerifier(): Promise<string> {
-    const entry = await this.auth.get(this.mcpName);
-    if (!entry?.codeVerifier) throw new Error(`No code verifier saved for MCP server: ${this.mcpName}`);
-    return entry.codeVerifier;
+  codeVerifier(): Promise<string> {
+    const mcpName = this.mcpName;
+    return Effect.runPromise(
+      this.auth.getEffect(mcpName).pipe(
+        Effect.flatMap((entry) =>
+          entry?.codeVerifier
+            ? Effect.succeed(entry.codeVerifier)
+            : Effect.fail(new Error(`No code verifier saved for MCP server: ${mcpName}`)),
+        ),
+      ),
+    );
   }
 
   /** Persists the OAuth state supplied by the MCP SDK. */
-  async saveState(state: string): Promise<void> {
-    if (!this.active) return;
-    await this.auth.updateOAuthState(this.mcpName, state, this.writeFence);
+  saveState(state: string): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    return Effect.runPromise(this.auth.updateOAuthStateEffect(this.mcpName, state, this.writeFence));
   }
 
   /** Returns an existing OAuth state or creates one for the current OAuth flow. */
-  async state(): Promise<string> {
-    const entry = await this.auth.get(this.mcpName);
-    if (entry?.oauthState) return entry.oauthState;
-    const state = randomHex();
-    await this.auth.updateOAuthState(this.mcpName, state, this.writeFence);
-    if (!this.active) throw new Error(`OAuth provider is inactive for MCP server: ${this.mcpName}`);
-    return state;
+  state(): Promise<string> {
+    const self = this;
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const entry = yield* self.auth.getEffect(self.mcpName);
+        if (entry?.oauthState) return entry.oauthState;
+        const state = randomHex();
+        yield* self.auth.updateOAuthStateEffect(self.mcpName, state, self.writeFence);
+        if (!self.active) return yield* Effect.fail(new Error(`OAuth provider is inactive for MCP server: ${self.mcpName}`));
+        return state;
+      }),
+    );
   }
 
   /** Persists OAuth discovery data across the browser redirect round trip. */
-  async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
-    if (!this.active) return;
-    await this.auth.updateDiscoveryState(this.mcpName, toAuthDiscoveryState(state), this.writeFence);
+  saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    return Effect.runPromise(this.auth.updateDiscoveryStateEffect(this.mcpName, toAuthDiscoveryState(state), this.writeFence));
   }
 
   /** Returns OAuth discovery data for the active browser round trip. */
-  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
-    const state = (await this.auth.get(this.mcpName))?.discoveryState;
-    if (!state) return undefined;
-    // SAFETY: AuthStore parsed the persisted JSON object and this provider originally received these fields from the SDK.
-    return state as OAuthDiscoveryState;
+  discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    return Effect.runPromise(
+      this.auth.getEffect(this.mcpName).pipe(
+        Effect.map((entry) => {
+          const state = entry?.discoveryState;
+          if (!state) return undefined;
+          // SAFETY: AuthStore parsed this JSON object after it originally came from the SDK.
+          return state as OAuthDiscoveryState;
+        }),
+      ),
+    );
   }
 
   /** Prevents late SDK callbacks from mutating credentials after cancellation or shutdown. */
@@ -230,60 +256,57 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   /** Removes only the credential scope invalidated by the SDK. */
-  async invalidateCredentials(type: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
-    if (!this.active) return;
-    try {
-      switch (type) {
-        case "all":
-          await this.auth.remove(this.mcpName);
-          return;
-        case "client":
-          await this.auth.clearClientInfo(this.mcpName, this.writeFence);
-          return;
-        case "tokens":
-          await this.auth.clearTokens(this.mcpName, this.writeFence);
-          return;
-        case "verifier":
-          await this.auth.clearCodeVerifier(this.mcpName, this.writeFence);
-          return;
-        case "discovery":
-          await this.auth.clearDiscoveryState(this.mcpName, this.writeFence);
-      }
-    } finally {
-      await this.releaseRefreshLock();
-    }
+  invalidateCredentials(type: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    const invalidate =
+      type === "all"
+        ? this.auth.removeEffect(this.mcpName)
+        : type === "client"
+          ? this.auth.clearClientInfoEffect(this.mcpName, this.writeFence)
+          : type === "tokens"
+            ? this.auth.clearTokensEffect(this.mcpName, this.writeFence)
+            : type === "verifier"
+              ? this.auth.clearCodeVerifierEffect(this.mcpName, this.writeFence)
+              : this.auth.clearDiscoveryStateEffect(this.mcpName, this.writeFence);
+    return Effect.runPromise(invalidate.pipe(Effect.ensuring(this.releaseRefreshLockEffect().pipe(Effect.ignore))));
   }
 
-  private async acquireRefreshLock(): Promise<void> {
-    if (this.refreshLock) return;
-    const acquisition = this.refreshLockAcquisition ?? this.auth.acquireOAuthRefreshLock(this.mcpName);
-    this.refreshLockAcquisition = acquisition;
-    try {
-      const refreshLock = await acquisition;
-      if (!this.active) {
-        await refreshLock.release();
-        throw new Error(`OAuth provider is inactive for MCP server: ${this.mcpName}`);
-      }
-      this.refreshLock = refreshLock;
-      if (!this.refreshLockTimeout) {
-        this.refreshLockTimeout = setTimeout(() => {
-          void this.releaseRefreshLock().catch((error: unknown) => {
-            warnRefreshLockRelease(this.mcpName, error);
-          });
-        }, MAX_REFRESH_LOCK_HOLD_MILLISECONDS);
-        this.refreshLockTimeout.unref();
-      }
-    } finally {
-      if (this.refreshLockAcquisition === acquisition) this.refreshLockAcquisition = undefined;
-    }
+  private acquireRefreshLockEffect() {
+    const self = this;
+    return this.refreshMutex.withPermits(1)(
+      Effect.gen(function* () {
+        if (self.refreshLock) return;
+        const refreshLock = yield* self.auth.acquireOAuthRefreshLockEffect(self.mcpName);
+        if (!self.active) {
+          yield* refreshLock.releaseEffect;
+          return yield* Effect.fail(new Error(`OAuth provider is inactive for MCP server: ${self.mcpName}`));
+        }
+        self.refreshLock = refreshLock;
+        if (!self.refreshLockTimeout) {
+          self.refreshLockTimeout = setTimeout(() => {
+            Effect.runPromise(self.releaseRefreshLockEffect()).catch((error: unknown) => warnRefreshLockRelease(self.mcpName, error));
+          }, MAX_REFRESH_LOCK_HOLD_MILLISECONDS);
+          self.refreshLockTimeout.unref();
+        }
+      }),
+    );
   }
 
-  private async releaseRefreshLock(): Promise<void> {
-    if (this.refreshLockTimeout) clearTimeout(this.refreshLockTimeout);
-    this.refreshLockTimeout = undefined;
-    const refreshLock = this.refreshLock;
-    this.refreshLock = undefined;
-    if (refreshLock) await refreshLock.release();
+  private releaseRefreshLock(): Promise<void> {
+    return Effect.runPromise(this.releaseRefreshLockEffect());
+  }
+
+  private releaseRefreshLockEffect() {
+    const self = this;
+    return this.refreshMutex.withPermits(1)(
+      Effect.gen(function* () {
+        if (self.refreshLockTimeout) clearTimeout(self.refreshLockTimeout);
+        self.refreshLockTimeout = undefined;
+        const refreshLock = self.refreshLock;
+        self.refreshLock = undefined;
+        if (refreshLock) yield* refreshLock.releaseEffect;
+      }),
+    );
   }
 }
 

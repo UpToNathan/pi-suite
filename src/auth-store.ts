@@ -31,6 +31,8 @@ export interface AuthWriteFence {
 /** Cross-process lease that serializes refresh-token rotation for one MCP server. */
 export interface AuthRefreshLock {
   readonly [AUTH_REFRESH_LOCK]: symbol;
+  /** Effect-native release of the refresh-token rotation lease. */
+  readonly releaseEffect: Effect.Effect<void, unknown>;
   /** Releases the refresh-token rotation lease; repeated calls are safe. */
   release(): Promise<void>;
 }
@@ -91,7 +93,12 @@ export class AuthStore {
 
   /** Replaces the auth entry for one MCP server. */
   set(mcpName: string, entry: AuthEntry, serverUrl?: string) {
-    return this.mutate((data) => ({
+    return Effect.runPromise(this.setEffect(mcpName, entry, serverUrl));
+  }
+
+  /** Effect-native replacement of one auth entry. */
+  setEffect(mcpName: string, entry: AuthEntry, serverUrl?: string) {
+    return this.mutateEffect((data) => ({
       ...data,
       [mcpName]: serverUrl ? { ...entry, serverUrl } : entry,
     }));
@@ -99,7 +106,12 @@ export class AuthStore {
 
   /** Removes all stored auth state for one MCP server. */
   remove(mcpName: string) {
-    return this.mutate((data) => {
+    return Effect.runPromise(this.removeEffect(mcpName));
+  }
+
+  /** Effect-native removal of one auth entry. */
+  removeEffect(mcpName: string) {
+    return this.mutateEffect((data) => {
       const next = { ...data };
       delete next[mcpName];
       return next;
@@ -108,7 +120,12 @@ export class AuthStore {
 
   /** Stores OAuth tokens while retaining a rotating refresh token when a response omits its replacement. */
   updateTokens(mcpName: string, tokens: AuthTokens, serverUrl?: string, fence?: AuthWriteFence): Promise<void> {
-    return this.updateEntry(
+    return Effect.runPromise(this.updateTokensEffect(mcpName, tokens, serverUrl, fence));
+  }
+
+  /** Effect-native token update preserving rotating refresh tokens. */
+  updateTokensEffect(mcpName: string, tokens: AuthTokens, serverUrl?: string, fence?: AuthWriteFence) {
+    return this.updateEntryEffect(
       mcpName,
       (entry) => ({
         ...entry,
@@ -123,85 +140,145 @@ export class AuthStore {
   }
 
   /** Acquires the cross-process refresh-token rotation lock for one MCP server. */
-  async acquireOAuthRefreshLock(mcpName: string): Promise<AuthRefreshLock> {
+  acquireOAuthRefreshLock(mcpName: string): Promise<AuthRefreshLock> {
+    return Effect.runPromise(this.acquireOAuthRefreshLockEffect(mcpName));
+  }
+
+  /** Effect-native acquisition of the refresh-token rotation lock. */
+  acquireOAuthRefreshLockEffect(mcpName: string) {
     const digest = createHash("sha256").update(mcpName).digest("hex");
     const target = `${this.filepath}.refresh-${digest}`;
-    const release = await acquireInterprocessLock(target);
-    let released = false;
-    return {
-      [AUTH_REFRESH_LOCK]: Symbol(mcpName),
-      async release(): Promise<void> {
-        if (released) return;
-        released = true;
-        await release();
-      },
-    };
+    return Effect.tryPromise({ try: () => acquireInterprocessLock(target), catch: (error) => error }).pipe(
+      Effect.map((release): AuthRefreshLock => {
+        let released = false;
+        const releaseEffect = Effect.suspend(() => {
+          if (released) return Effect.void;
+          released = true;
+          return Effect.tryPromise({ try: () => release(), catch: (error) => error });
+        });
+        return {
+          [AUTH_REFRESH_LOCK]: Symbol(mcpName),
+          releaseEffect,
+          release: () => Effect.runPromise(releaseEffect),
+        };
+      }),
+    );
   }
 
   /** Stores OAuth client registration metadata for one MCP server. */
   updateClientInfo(mcpName: string, clientInfo: AuthClientInfo, serverUrl?: string, fence?: AuthWriteFence): Promise<void> {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, clientInfo, ...(serverUrl ? { serverUrl } : {}) }), fence);
+    return Effect.runPromise(this.updateClientInfoEffect(mcpName, clientInfo, serverUrl, fence));
+  }
+
+  /** Effect-native client registration update. */
+  updateClientInfoEffect(mcpName: string, clientInfo: AuthClientInfo, serverUrl?: string, fence?: AuthWriteFence) {
+    return this.updateEntryEffect(mcpName, (entry) => ({ ...entry, clientInfo, ...(serverUrl ? { serverUrl } : {}) }), fence);
   }
 
   /** Stores OAuth discovery state for an in-flight browser round trip. */
   updateDiscoveryState(mcpName: string, discoveryState: AuthDiscoveryState, fence?: AuthWriteFence): Promise<void> {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, discoveryState }), fence);
+    return Effect.runPromise(this.updateDiscoveryStateEffect(mcpName, discoveryState, fence));
+  }
+
+  /** Effect-native discovery-state update. */
+  updateDiscoveryStateEffect(mcpName: string, discoveryState: AuthDiscoveryState, fence?: AuthWriteFence) {
+    return this.updateEntryEffect(mcpName, (entry) => ({ ...entry, discoveryState }), fence);
   }
 
   /** Removes OAuth discovery state without clearing unrelated credentials. */
   clearDiscoveryState(mcpName: string, fence?: AuthWriteFence): Promise<void> {
-    return this.clearField(mcpName, "discoveryState", fence);
+    return Effect.runPromise(this.clearDiscoveryStateEffect(mcpName, fence));
+  }
+
+  /** Effect-native discovery-state removal. */
+  clearDiscoveryStateEffect(mcpName: string, fence?: AuthWriteFence) {
+    return this.clearFieldEffect(mcpName, "discoveryState", fence);
   }
 
   /** Removes stored OAuth tokens without clearing client registration or flow state. */
   clearTokens(mcpName: string, fence?: AuthWriteFence): Promise<void> {
-    return this.clearField(mcpName, "tokens", fence);
+    return Effect.runPromise(this.clearTokensEffect(mcpName, fence));
+  }
+
+  /** Effect-native token removal. */
+  clearTokensEffect(mcpName: string, fence?: AuthWriteFence) {
+    return this.clearFieldEffect(mcpName, "tokens", fence);
   }
 
   /** Removes stored OAuth client registration without clearing tokens or flow state. */
   clearClientInfo(mcpName: string, fence?: AuthWriteFence): Promise<void> {
-    return this.clearField(mcpName, "clientInfo", fence);
+    return Effect.runPromise(this.clearClientInfoEffect(mcpName, fence));
+  }
+
+  /** Effect-native client registration removal. */
+  clearClientInfoEffect(mcpName: string, fence?: AuthWriteFence) {
+    return this.clearFieldEffect(mcpName, "clientInfo", fence);
   }
 
   /** Stores a PKCE code verifier for an in-flight OAuth flow. */
   updateCodeVerifier(mcpName: string, codeVerifier: string, fence?: AuthWriteFence): Promise<void> {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, codeVerifier }), fence);
+    return Effect.runPromise(this.updateCodeVerifierEffect(mcpName, codeVerifier, fence));
+  }
+
+  /** Effect-native PKCE verifier update. */
+  updateCodeVerifierEffect(mcpName: string, codeVerifier: string, fence?: AuthWriteFence) {
+    return this.updateEntryEffect(mcpName, (entry) => ({ ...entry, codeVerifier }), fence);
   }
 
   /** Removes the PKCE code verifier after OAuth completion or cancellation. */
   clearCodeVerifier(mcpName: string, fence?: AuthWriteFence): Promise<void> {
-    return this.clearField(mcpName, "codeVerifier", fence);
+    return Effect.runPromise(this.clearCodeVerifierEffect(mcpName, fence));
+  }
+
+  /** Effect-native PKCE verifier removal. */
+  clearCodeVerifierEffect(mcpName: string, fence?: AuthWriteFence) {
+    return this.clearFieldEffect(mcpName, "codeVerifier", fence);
   }
 
   /** Stores the OAuth state value for an in-flight OAuth flow. */
   updateOAuthState(mcpName: string, oauthState: string, fence?: AuthWriteFence): Promise<void> {
-    return this.updateEntry(mcpName, (entry) => ({ ...entry, oauthState }), fence);
+    return Effect.runPromise(this.updateOAuthStateEffect(mcpName, oauthState, fence));
+  }
+
+  /** Effect-native OAuth state update. */
+  updateOAuthStateEffect(mcpName: string, oauthState: string, fence?: AuthWriteFence) {
+    return this.updateEntryEffect(mcpName, (entry) => ({ ...entry, oauthState }), fence);
   }
 
   /** Reads the OAuth state value for an in-flight OAuth flow, if present. */
-  async getOAuthState(mcpName: string) {
-    return (await this.get(mcpName))?.oauthState;
+  getOAuthState(mcpName: string) {
+    return Effect.runPromise(this.getOAuthStateEffect(mcpName));
+  }
+
+  /** Effect-native OAuth state lookup. */
+  getOAuthStateEffect(mcpName: string) {
+    return this.getEffect(mcpName).pipe(Effect.map((entry) => entry?.oauthState));
   }
 
   /** Removes the OAuth state value after OAuth completion or cancellation. */
   clearOAuthState(mcpName: string, fence?: AuthWriteFence): Promise<void> {
-    return this.clearField(mcpName, "oauthState", fence);
+    return Effect.runPromise(this.clearOAuthStateEffect(mcpName, fence));
+  }
+
+  /** Effect-native OAuth state removal. */
+  clearOAuthStateEffect(mcpName: string, fence?: AuthWriteFence) {
+    return this.clearFieldEffect(mcpName, "oauthState", fence);
   }
 
   /** Classifies the stored token state for one MCP server. */
-  async authStatus(mcpName: string): Promise<AuthStatus> {
-    const entry = await this.get(mcpName);
-    if (!entry?.tokens) return "not_authenticated";
-    if (!entry.tokens.expiresAt) return "authenticated";
-    return entry.tokens.expiresAt < Date.now() / 1000 ? "expired" : "authenticated";
+  authStatus(mcpName: string): Promise<AuthStatus> {
+    return Effect.runPromise(this.authStatusEffect(mcpName));
   }
 
-  private updateEntry(
-    mcpName: string,
-    update: (entry: AuthEntry) => AuthEntry,
-    fence?: AuthWriteFence,
-  ): Promise<void> {
-    return Effect.runPromise(this.updateEntryEffect(mcpName, update, fence));
+  /** Effect-native classification of stored token state. */
+  authStatusEffect(mcpName: string) {
+    return this.getEffect(mcpName).pipe(
+      Effect.map((entry): AuthStatus => {
+        if (!entry?.tokens) return "not_authenticated";
+        if (!entry.tokens.expiresAt) return "authenticated";
+        return entry.tokens.expiresAt < Date.now() / 1000 ? "expired" : "authenticated";
+      }),
+    );
   }
 
   private updateEntryEffect(mcpName: string, update: (entry: AuthEntry) => AuthEntry, fence?: AuthWriteFence) {
@@ -211,10 +288,6 @@ export class AuthStore {
     });
   }
 
-  private clearField(mcpName: string, field: keyof AuthEntry, fence?: AuthWriteFence): Promise<void> {
-    return Effect.runPromise(this.clearFieldEffect(mcpName, field, fence));
-  }
-
   private clearFieldEffect(mcpName: string, field: keyof AuthEntry, fence?: AuthWriteFence) {
     return this.mutateEffect((data) => {
       if (fence && this.activeWriteFences.get(mcpName) !== fence) return data;
@@ -222,10 +295,6 @@ export class AuthStore {
       if (!entry) return data;
       return { ...data, [mcpName]: clearAuthEntryField(entry, field) };
     });
-  }
-
-  private mutate(update: (data: AuthData) => AuthData): Promise<void> {
-    return Effect.runPromise(this.mutateEffect(update));
   }
 
   private mutateEffect(update: (data: AuthData) => AuthData) {

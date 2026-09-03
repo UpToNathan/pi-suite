@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { Effect } from "effect";
 import { createServer } from "node:http";
 import { access, mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -957,15 +958,11 @@ class PausingAuthStore extends AuthStore {
   private readonly reachedPause = makeDeferred();
   private readonly resumePause = makeDeferred();
 
-  override async updateTokens(
-    mcpName: string,
-    tokens: AuthTokens,
-    serverUrl?: string,
-    fence?: AuthWriteFence,
-  ): Promise<void> {
+  override updateTokensEffect(mcpName: string, tokens: AuthTokens, serverUrl?: string, fence?: AuthWriteFence) {
     this.reachedPause.resolve();
-    await this.resumePause.promise;
-    await super.updateTokens(mcpName, tokens, serverUrl, fence);
+    return Effect.tryPromise({ try: () => this.resumePause.promise, catch: (error) => error }).pipe(
+      Effect.andThen(super.updateTokensEffect(mcpName, tokens, serverUrl, fence)),
+    );
   }
 
   async waitUntilPaused(): Promise<void> {
