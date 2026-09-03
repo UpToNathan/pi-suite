@@ -139,13 +139,18 @@ async function confirmMcpLogout(ctx: ExtensionCommandContext, server: string): P
   return ctx.ui.confirm("Remove MCP OAuth credentials?", `Log out of ${server}. You will need to authenticate again.`);
 }
 
-async function runMcpPrompt(
+function runMcpPrompt(
   ctx: ExtensionCommandContext,
   manager: McpManager,
   server: string,
   sendUserMessage: (text: string) => void,
 ): Promise<boolean> {
-  const result = await runMcpOperation(ctx, "loading-prompts", () => manager.prompts({ signal: undefined }));
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const result = yield* Effect.tryPromise({
+        try: () => runMcpOperation(ctx, "loading-prompts", () => manager.prompts({ signal: undefined })),
+        catch: (error) => error,
+      });
   const prompts = result.prompts.filter((prompt) => prompt.client === server);
   if (prompts.length === 0) {
     ctx.ui.notify(`MCP server ${server} has no prompts`, "warning");
@@ -153,17 +158,18 @@ async function runMcpPrompt(
   }
 
   const choices = prompts.map((prompt) => formatPromptChoice(prompt));
-  const choice = await ctx.ui.select(`MCP prompt — ${server}`, choices);
+  const choice = yield* Effect.tryPromise({ try: () => ctx.ui.select(`MCP prompt — ${server}`, choices), catch: (error) => error });
   if (choice === undefined) return false;
   const selectedIndex = choices.indexOf(choice);
   const selected = prompts[selectedIndex];
   if (selected === undefined) return false;
 
-  const args = await collectPromptArguments(ctx, selected);
+  const args = yield* Effect.tryPromise({ try: () => collectPromptArguments(ctx, selected), catch: (error) => error });
   if (args === undefined) return false;
-  const prompt = await runMcpOperation(ctx, "fetching-prompt", () =>
-    manager.getPrompt(server, selected.name, args, { signal: undefined }),
-  );
+  const prompt = yield* Effect.tryPromise({
+    try: () => runMcpOperation(ctx, "fetching-prompt", () => manager.getPrompt(server, selected.name, args, { signal: undefined })),
+    catch: (error) => error,
+  });
   const text = prompt.messages
     ?.map((message) => {
       const content = message.content;
@@ -177,8 +183,10 @@ async function runMcpPrompt(
     ctx.ui.notify("MCP prompt returned no text content", "warning");
     return false;
   }
-  sendUserMessage(text);
-  return true;
+      sendUserMessage(text);
+      return true;
+    }),
+  );
 }
 
 function collectPromptArguments(
