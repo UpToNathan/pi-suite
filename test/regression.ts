@@ -16,6 +16,7 @@ import { root } from "./helpers.js";
 
 async function main() {
   await rejectsInvalidServerConfig();
+  await mergesProjectConfigs();
   await loadsProxyToolMode();
   await loadsStartupMode();
   await rejectsMissingEnvironmentPlaceholder();
@@ -209,6 +210,36 @@ async function rejectsInvalidServerConfig() {
   );
 
   await assert.rejects(() => loadMcpConfig({ cwd: dir }), /mcp\.broken\.url must be a non-empty string/);
+}
+
+async function mergesProjectConfigs() {
+  const project = await mkdtemp(path.join(tmpdir(), "pi-mcp-project-config-"));
+  await mkdir(path.join(project, ".pi"), { recursive: true });
+  await writeFile(
+    path.join(project, "opencode.json"),
+    JSON.stringify({
+      mcpServers: {
+        global: { type: "local", command: ["global-server"] },
+        shared: { type: "local", command: ["global-server"] },
+      },
+    }),
+  );
+  await writeFile(
+    path.join(project, ".pi", "mcp.json"),
+    JSON.stringify({
+      mcp: {
+        project: { type: "local", command: ["project-server"] },
+        shared: { type: "local", command: ["project-server"] },
+      },
+    }),
+  );
+
+  const config = await loadMcpConfig({ cwd: project });
+  assert.ok(config.servers.global);
+  assert.ok(config.servers.project);
+  assert.ok(config.servers.shared);
+  assert.deepEqual(config.servers.global?.type === "local" ? config.servers.global.command : [], ["global-server"]);
+  assert.deepEqual(config.servers.shared?.type === "local" ? config.servers.shared.command : [], ["project-server"]);
 }
 
 async function loadsProxyToolMode() {

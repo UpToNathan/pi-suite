@@ -12,7 +12,7 @@ interface LoadOptions {
 
 type ServerEntryMode = "strict" | "discover";
 
-/** Loads the first OpenCode-compatible MCP configuration available for a Pi session. */
+/** Loads and merges OpenCode-compatible MCP configurations for a Pi session. */
 export async function loadMcpConfig(options: LoadOptions): Promise<McpConfig> {
   const envConfig = process.env.PI_MCP_CONFIG;
   if (envConfig) {
@@ -21,13 +21,33 @@ export async function loadMcpConfig(options: LoadOptions): Promise<McpConfig> {
     return parseConfig(envConfig, "PI_MCP_CONFIG");
   }
 
+  const configs: McpConfig[] = [];
   for (const file of candidateConfigFiles(options.cwd)) {
-    if (!existsSync(file)) continue;
-    const parsed = parseConfig(await readFile(file, "utf8"), file);
-    if (hasConfigContent(parsed)) return parsed;
+    if (existsSync(file)) configs.push(parseConfig(await readFile(file, "utf8"), file));
+  }
+  return mergeConfigs(configs.reverse());
+}
+
+function mergeConfigs(configs: McpConfig[]): McpConfig {
+  const servers: Record<string, McpServerConfig> = {};
+  let timeout: number | undefined;
+  let toolMode: McpToolMode | undefined;
+  let startup: McpStartupMode | undefined;
+
+  for (const config of configs) {
+    Object.assign(servers, config.servers);
+    timeout = config.timeout ?? timeout;
+    toolMode = config.toolMode ?? toolMode;
+    startup = config.startup ?? startup;
   }
 
-  return { servers: {} };
+  return {
+    servers,
+    ...(timeout !== undefined ? { timeout } : {}),
+    ...(toolMode !== undefined ? { toolMode } : {}),
+    ...(startup !== undefined ? { startup } : {}),
+    ...(configs.length > 0 ? { source: configs.map((config) => config.source).filter(Boolean).join(", ") } : {}),
+  };
 }
 
 function candidateConfigFiles(cwd: string) {
@@ -51,11 +71,13 @@ function parseConfig(text: string, source: string): McpConfig {
   }
   if (!isPlainRecord(parsed)) return { servers: {}, source };
 
-  if ("mcp" in parsed) {
-    if (!isPlainRecord(parsed.mcp)) {
-      throw new Error(`Invalid MCP config in ${source}: mcp must be an object`);
+  if ("mcp" in parsed || "mcpServers" in parsed) {
+    const key = "mcp" in parsed ? "mcp" : "mcpServers";
+    const section = parsed[key];
+    if (!isPlainRecord(section)) {
+      throw new Error(`Invalid MCP config in ${source}: ${key} must be an object`);
     }
-    return parseMcpSection(parsed.mcp, source, "mcp", "strict");
+    return parseMcpSection(section, source, key, "strict");
   }
 
   if (looksLikeFlatMcpSection(parsed)) {
@@ -248,15 +270,6 @@ function makeConfig(
     ...(toolMode !== undefined ? { toolMode } : {}),
     ...(startup !== undefined ? { startup } : {}),
   };
-}
-
-function hasConfigContent(config: McpConfig) {
-  return (
-    Object.keys(config.servers).length > 0 ||
-    config.timeout !== undefined ||
-    config.toolMode !== undefined ||
-    config.startup !== undefined
-  );
 }
 
 function looksLikeFlatMcpSection(section: Record<string, unknown>) {
