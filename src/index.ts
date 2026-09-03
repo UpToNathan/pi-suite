@@ -612,12 +612,18 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     pi.setActiveTools([...active]);
   }
 
-  pi.on("session_start", async (_event, ctx) => {
-    latestContext = ctx;
-    const loaded = await loadConfigured(ctx);
-    updateMcpStatus(ctx);
-    if (startupMode(config) === "eager") startBackgroundConnectionRefresh(ctx, loaded.activeManager, loaded.generation);
-  });
+  pi.on("session_start", (_event, ctx) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        latestContext = ctx;
+        const loaded = yield* Effect.tryPromise({ try: () => loadConfigured(ctx), catch: (error) => error });
+        yield* Effect.sync(() => updateMcpStatus(ctx));
+        if (startupMode(config) === "eager") {
+          yield* Effect.sync(() => startBackgroundConnectionRefresh(ctx, loaded.activeManager, loaded.generation));
+        }
+      }),
+    ),
+  );
 
   pi.on("session_shutdown", () =>
     Effect.runPromise(
