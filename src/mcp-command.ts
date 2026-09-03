@@ -92,22 +92,23 @@ async function createMcpManagerView(manager: McpManager, config: McpConfig): Pro
     Effect.forEach(
       Object.entries(config.servers).sort(([left], [right]) => left.localeCompare(right)),
       ([name, serverConfig]) =>
-        Effect.tryPromise({
-          try: async (): Promise<McpServerView> => {
-            const client = clients.get(name);
-            return {
-              name,
-              type: serverConfig.type,
-              target: formatMcpServerTarget(serverConfig),
-              status: statuses[name] ?? { status: "disabled" },
-              authStatus:
-                serverConfig.type === "remote" && serverConfig.oauth !== false ? await manager.authStatus(name) : undefined,
-              hasPrompts: client?.hasPrompts ?? false,
-              hasResources: client?.hasResources ?? false,
-              toolCount: toolCounts.get(name) ?? 0,
-            };
-          },
-          catch: (error) => error,
+        Effect.gen(function* () {
+          const client = clients.get(name);
+          const authStatus =
+            serverConfig.type === "remote" && serverConfig.oauth !== false
+              ? yield* Effect.tryPromise({ try: () => manager.authStatus(name), catch: (error) => error })
+              : undefined;
+          const view: McpServerView = {
+            name,
+            type: serverConfig.type,
+            target: formatMcpServerTarget(serverConfig),
+            status: statuses[name] ?? { status: "disabled" },
+            authStatus,
+            hasPrompts: client?.hasPrompts ?? false,
+            hasResources: client?.hasResources ?? false,
+            toolCount: toolCounts.get(name) ?? 0,
+          };
+          return view;
         }),
       { concurrency: "unbounded" },
     ),
