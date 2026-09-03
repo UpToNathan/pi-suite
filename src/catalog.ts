@@ -1,5 +1,6 @@
 import { CallToolResultSchema } from "@modelcontextprotocol/core";
 import { Client } from "@modelcontextprotocol/client";
+import { Effect } from "effect";
 import type { CallToolResult, Prompt, Resource, Tool } from "@modelcontextprotocol/client";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
@@ -19,24 +20,33 @@ import type { CancellableOptions } from "./types.js";
  * @template T Item type accumulated from each page.
  * @template R Page result shape containing an optional cursor.
  */
-export async function paginate<T, R extends { nextCursor?: string | undefined }>(
+export function paginate<T, R extends { nextCursor?: string | undefined }>(
   list: (cursor?: string) => Promise<R>,
   items: (result: R) => T[],
 ): Promise<T[]> {
-  const result: T[] = [];
-  const cursors = new Set<string>();
-  let cursor: string | undefined;
+  return Effect.runPromise(paginateEffect(list, items));
+}
 
-  for (let page = 0; page < MAX_LIST_PAGES; page++) {
-    const current = await list(cursor);
-    result.push(...items(current));
-    if (current.nextCursor === undefined) return result;
-    if (cursors.has(current.nextCursor)) throw new Error(`MCP list returned duplicate cursor: ${current.nextCursor}`);
-    cursors.add(current.nextCursor);
-    cursor = current.nextCursor;
-  }
+function paginateEffect<T, R extends { nextCursor?: string | undefined }>(
+  list: (cursor?: string) => Promise<R>,
+  items: (result: R) => T[],
+) {
+  return Effect.gen(function* () {
+    const result: T[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
 
-  throw new Error(`MCP list exceeded ${MAX_LIST_PAGES} pages`);
+    for (let page = 0; page < MAX_LIST_PAGES; page++) {
+      const current = yield* Effect.tryPromise({ try: () => list(cursor), catch: (error) => error });
+      result.push(...items(current));
+      if (current.nextCursor === undefined) return result;
+      if (cursors.has(current.nextCursor)) throw new Error(`MCP list returned duplicate cursor: ${current.nextCursor}`);
+      cursors.add(current.nextCursor);
+      cursor = current.nextCursor;
+    }
+
+    throw new Error(`MCP list exceeded ${MAX_LIST_PAGES} pages`);
+  });
 }
 
 /** Lists tools from an MCP client while rejecting cursor loops. */
@@ -71,44 +81,54 @@ export function toolParameters(tool: Tool) {
 }
 
 /** Calls one MCP tool and converts MCP content into Pi tool result content. */
-export async function callMcpTool(input: {
+export function callMcpTool(input: {
   readonly client: Client;
   readonly tool: Tool;
   readonly args: Record<string, unknown>;
   readonly timeout?: number;
   readonly signal: AbortSignal | undefined;
 }): Promise<AgentToolResult<Record<string, unknown>>> {
-  const rawResult = await input.client.callTool(
-    {
-      name: input.tool.name,
-      arguments: input.args,
-    },
-    {
-      ...requestOptions(input.timeout, input.signal),
-      toolDefinition: input.tool,
-    },
-  );
-  const result = normalizeCallToolResult(rawResult);
+  return Effect.runPromise(callMcpToolEffect(input));
+}
 
-  if (result.isError) {
-    throw new Error(textFromCallResult(result) || "MCP tool returned an error");
-  }
+function callMcpToolEffect(input: {
+  readonly client: Client;
+  readonly tool: Tool;
+  readonly args: Record<string, unknown>;
+  readonly timeout?: number;
+  readonly signal: AbortSignal | undefined;
+}) {
+  return Effect.gen(function* () {
+    const rawResult = yield* Effect.tryPromise({
+      try: () =>
+        input.client.callTool(
+          {
+            name: input.tool.name,
+            arguments: input.args,
+          },
+          {
+            ...requestOptions(input.timeout, input.signal),
+            toolDefinition: input.tool,
+          },
+        ),
+      catch: (error) => error,
+    });
+    const result = normalizeCallToolResult(rawResult);
 
-  if (result.structuredContent !== undefined && result.structuredContent !== null) {
+    if (result.isError) throw new Error(textFromCallResult(result) || "MCP tool returned an error");
+    if (result.structuredContent !== undefined && result.structuredContent !== null) {
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result.structuredContent) }],
+        details: { structuredContent: result.structuredContent, rawContent: result.content },
+      };
+    }
+
+    const converted = convertMcpContent(result.content);
     return {
-      content: [{ type: "text", text: JSON.stringify(result.structuredContent) }],
-      details: { structuredContent: result.structuredContent, rawContent: result.content },
+      content: converted.content,
+      details: { omitted: converted.omitted, rawContent: result.content },
     };
-  }
-
-  const converted = convertMcpContent(result.content);
-  return {
-    content: converted.content,
-    details: {
-      omitted: converted.omitted,
-      rawContent: result.content,
-    },
-  };
+  });
 }
 
 /** Projects MCP resource metadata into the JSON shape returned by Pi's resource-list tool. */
