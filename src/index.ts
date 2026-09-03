@@ -56,7 +56,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
   let backgroundConnectionRefresh: Promise<void> | undefined;
   const elicitationContexts = new AsyncLocalStorage<ExtensionContext | undefined>();
 
-  async function ensureManager(ctx: ExtensionContext) {
+  function ensureManager(ctx: ExtensionContext) {
     latestContext = ctx;
     if (manager) return manager;
     manager = new McpManager({
@@ -76,7 +76,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         const generation = configGeneration + 1;
         configGeneration = generation;
         config = yield* Effect.tryPromise({ try: () => loadMcpConfig({ cwd: ctx.cwd }), catch: (error) => error });
-        const activeManager = yield* Effect.tryPromise({ try: () => ensureManager(ctx), catch: (error) => error });
+        const activeManager = yield* Effect.sync(() => ensureManager(ctx));
         const previous = registeredToolNames;
         registeredToolNames = new Set();
         yield* Effect.tryPromise({
