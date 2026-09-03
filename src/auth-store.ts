@@ -242,18 +242,21 @@ export class AuthStore {
     );
   }
 
-  private async write(data: AuthData): Promise<void> {
-    await mkdir(path.dirname(this.filepath), { recursive: true });
-    const tmp = `${this.filepath}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      await writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
-      await rename(tmp, this.filepath);
-      await chmod(this.filepath, 0o600);
-    } finally {
-      await unlink(tmp).catch((error: unknown) => {
-        if (!isFileNotFoundError(error)) throw error;
-      });
-    }
+  private write(data: AuthData): Promise<void> {
+    const filepath = this.filepath;
+    const tmp = `${filepath}.${process.pid}.${randomUUID()}.tmp`;
+    const cleanup = Effect.tryPromise({
+      try: () => unlink(tmp),
+      catch: (error: unknown) => (isFileNotFoundError(error) ? undefined : error),
+    }).pipe(Effect.ignore);
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        yield* Effect.tryPromise({ try: () => mkdir(path.dirname(filepath), { recursive: true }), catch: (error) => error });
+        yield* Effect.tryPromise({ try: () => writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 }), catch: (error) => error });
+        yield* Effect.tryPromise({ try: () => rename(tmp, filepath), catch: (error) => error });
+        yield* Effect.tryPromise({ try: () => chmod(filepath, 0o600), catch: (error) => error });
+      }).pipe(Effect.ensuring(cleanup)),
+    );
   }
 }
 
