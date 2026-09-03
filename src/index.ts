@@ -357,9 +357,11 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     );
   }
 
-  async function proxyResources(server: string | undefined, signal: AbortSignal | undefined) {
-    if (server) await ensureProxyServerConnected(server, { signal });
-    else await ensureProxyServersConnected({ signal });
+  function proxyResources(server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        if (server) yield* Effect.tryPromise({ try: () => ensureProxyServerConnected(server, { signal }), catch: (error) => error });
+        else yield* Effect.tryPromise({ try: () => ensureProxyServersConnected({ signal }), catch: (error) => error });
     const resourceServers = resourceServerNames();
     if (server && !resourceServers.includes(server)) {
       return proxyText(`MCP server "${server}" does not support resources. Available resource servers: ${resourceServers.join(", ") || "none"}.`, {
@@ -368,7 +370,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         error: "resources_not_supported",
       });
     }
-    const result = await requireManager().resources(server, { signal });
+    const result = yield* Effect.tryPromise({ try: () => requireManager().resources(server, { signal }), catch: (error) => error });
     const sorted = [...result.resources].sort((a, b) =>
       `${a.client}\u0000${a.name}\u0000${a.uri}`.localeCompare(`${b.client}\u0000${b.name}\u0000${b.uri}`),
     );
@@ -376,25 +378,31 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       resources: formatResourceList(sorted),
       ...(result.failures.length > 0 ? { failures: result.failures } : {}),
     };
-    return proxyText(JSON.stringify(response, null, 2), {
-      mode: "resources",
-      count: sorted.length,
-      servers: resourceServers,
-      failures: result.failures.length,
-      ...(server ? { server } : {}),
-    });
+        return proxyText(JSON.stringify(response, null, 2), {
+          mode: "resources",
+          count: sorted.length,
+          servers: resourceServers,
+          failures: result.failures.length,
+          ...(server ? { server } : {}),
+        });
+      }),
+    );
   }
 
-  async function proxyReadResource(server: string | undefined, uri: string | undefined, signal: AbortSignal | undefined) {
-    if (!server) return proxyText("read-resource requires `server`.", { mode: "read-resource", error: "missing_server" });
+  function proxyReadResource(server: string | undefined, uri: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        if (!server) return proxyText("read-resource requires `server`.", { mode: "read-resource", error: "missing_server" });
     if (!uri) return proxyText("read-resource requires `uri`.", { mode: "read-resource", server, error: "missing_uri" });
-    await ensureProxyServerConnected(server, { signal });
-    const content = await requireManager().readResource(server, uri, { signal });
+    yield* Effect.tryPromise({ try: () => ensureProxyServerConnected(server, { signal }), catch: (error) => error });
+    const content = yield* Effect.tryPromise({ try: () => requireManager().readResource(server, uri, { signal }), catch: (error) => error });
     const formatted = formatResourceContent(server, uri, content);
-    return {
-      content: [{ type: "text" as const, text: formatted.text }, ...formatted.images],
-      details: { mode: "read-resource", server, uri, contents: formatted.count, images: formatted.images.length },
-    };
+        return {
+          content: [{ type: "text" as const, text: formatted.text }, ...formatted.images],
+          details: { mode: "read-resource", server, uri, contents: formatted.count, images: formatted.images.length },
+        };
+      }),
+    );
   }
 
   function proxyStatus() {
