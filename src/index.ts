@@ -262,16 +262,20 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     );
   }
 
-  async function proxyDescribe(toolName: string, server: string | undefined, signal: AbortSignal | undefined) {
-    await ensureProxyToolMetadata(toolName, server, { signal });
-    const found = findProxyTool(toolName, server);
-    if ("error" in found) return proxyText(found.error, found.details);
-    return proxyText(formatProxyToolDescription(found.entry), {
-      mode: "describe",
-      server: found.entry.server,
-      tool: found.entry.key,
-      originalName: found.entry.name,
-    });
+  function proxyDescribe(toolName: string, server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        yield* Effect.tryPromise({ try: () => ensureProxyToolMetadata(toolName, server, { signal }), catch: (error) => error });
+        const found = findProxyTool(toolName, server);
+        if ("error" in found) return proxyText(found.error, found.details);
+        return proxyText(formatProxyToolDescription(found.entry), {
+          mode: "describe",
+          server: found.entry.server,
+          tool: found.entry.key,
+          originalName: found.entry.name,
+        });
+      }),
+    );
   }
 
   async function proxySearch(query: string, regex: boolean, server: string | undefined, signal: AbortSignal | undefined) {
