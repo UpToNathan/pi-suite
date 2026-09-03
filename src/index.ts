@@ -249,13 +249,17 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     );
   }
 
-  async function proxyConnect(server: string) {
-    const status = await requireManager().connect(server, {
-      intent: "explicit",
-      signal: undefined,
-    });
-    registerDynamicTools();
-    return proxyText(formatStatus(server, config.servers[server], status), { mode: "connect", server, status: status.status });
+  function proxyConnect(server: string) {
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const status = yield* Effect.tryPromise({
+          try: () => requireManager().connect(server, { intent: "explicit", signal: undefined }),
+          catch: (error) => error,
+        });
+        yield* Effect.sync(() => registerDynamicTools());
+        return proxyText(formatStatus(server, config.servers[server], status), { mode: "connect", server, status: status.status });
+      }),
+    );
   }
 
   async function proxyDescribe(toolName: string, server: string | undefined, signal: AbortSignal | undefined) {
