@@ -112,7 +112,8 @@ export function callMcpTool(input: {
   return Effect.runPromise(callMcpToolEffect(input));
 }
 
-function callMcpToolEffect(input: {
+/** Effect-native MCP tool invocation and Pi result conversion. */
+export function callMcpToolEffect(input: {
   readonly client: Client;
   readonly tool: Tool;
   readonly args: Record<string, unknown>;

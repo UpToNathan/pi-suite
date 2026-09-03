@@ -149,7 +149,7 @@ export class AuthStore {
   acquireOAuthRefreshLockEffect(mcpName: string) {
     const digest = createHash("sha256").update(mcpName).digest("hex");
     const target = `${this.filepath}.refresh-${digest}`;
-    return Effect.tryPromise({ try: () => acquireInterprocessLock(target), catch: (error) => error }).pipe(
+    return acquireInterprocessLockEffect(target).pipe(
       Effect.mapError((cause) => new AuthStoreError({ message: `Could not acquire OAuth refresh lock for ${mcpName}`, cause })),
       Effect.map((release): AuthRefreshLock => {
         let released = false;
@@ -349,29 +349,35 @@ export class AuthStore {
 
 function withInterprocessLockEffect<A, E, R>(target: string, operation: Effect.Effect<A, E, R>) {
   return Effect.acquireUseRelease(
-    Effect.tryPromise({ try: () => acquireInterprocessLock(target), catch: (error) => error }),
+    acquireInterprocessLockEffect(target),
     () => operation,
     (release) => Effect.tryPromise({ try: () => release(), catch: () => undefined }).pipe(Effect.ignore),
   );
 }
 
-async function acquireInterprocessLock(target: string): Promise<() => Promise<void>> {
-  await mkdir(path.dirname(target), { recursive: true });
-  const release = await lock(target, {
-    realpath: false,
-    stale: AUTH_LOCK_STALE_MILLISECONDS,
-    update: AUTH_LOCK_UPDATE_MILLISECONDS,
-    retries: AUTH_LOCK_RETRY_OPTIONS,
-    // proper-lockfile caches metadata on fs; bypass Bun's proxied module object.
-    fs: nativeFs,
-  });
-  try {
-    await chmod(`${target}.lock`, 0o700);
+function acquireInterprocessLockEffect(target: string) {
+  return Effect.gen(function* () {
+    yield* Effect.tryPromise({ try: () => mkdir(path.dirname(target), { recursive: true }), catch: (error) => error });
+    const release = yield* Effect.tryPromise({
+      try: () => lock(target, {
+        realpath: false,
+        stale: AUTH_LOCK_STALE_MILLISECONDS,
+        update: AUTH_LOCK_UPDATE_MILLISECONDS,
+        retries: AUTH_LOCK_RETRY_OPTIONS,
+        // proper-lockfile caches metadata on fs; bypass Bun's proxied module object.
+        fs: nativeFs,
+      }),
+      catch: (error) => error,
+    });
+    const secured = yield* Effect.result(
+      Effect.tryPromise({ try: () => chmod(`${target}.lock`, 0o700), catch: (error) => error }),
+    );
+    if (secured._tag === "Failure") {
+      yield* Effect.tryPromise({ try: () => release(), catch: () => undefined }).pipe(Effect.ignore);
+      return yield* Effect.fail(secured.failure);
+    }
     return release;
-  } catch (error) {
-    await release();
-    throw error;
-  }
+  });
 }
 
 function parseAuthData(value: unknown): { data: AuthData; rejected: number } {

@@ -4,9 +4,9 @@ import { Text } from "@earendil-works/pi-tui";
 import type { Tool } from "@modelcontextprotocol/client";
 import type { TSchema } from "typebox";
 import { Type } from "typebox";
-import { Effect } from "effect";
-import { callMcpTool, formatResourceContent, formatResourceList, toolParameters } from "./catalog.js";
-import { loadMcpConfig } from "./config.js";
+import { Effect, Fiber } from "effect";
+import { callMcpTool, callMcpToolEffect, formatResourceContent, formatResourceList, toolParameters } from "./catalog.js";
+import { loadMcpConfigEffect } from "./config.js";
 import { formatMcpServerTarget, redactSecrets } from "./display.js";
 import { handlePiElicitation } from "./elicitation.js";
 import { McpManager, type McpToolEntry } from "./manager.js";
@@ -53,7 +53,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
   let registeredToolNames = new Set<string>();
   let latestContext: ExtensionContext | undefined;
   let configGeneration = 0;
-  let backgroundConnectionRefresh: Promise<void> | undefined;
+  let backgroundConnectionRefresh: Fiber.Fiber<void> | undefined;
   const elicitationContexts = new AsyncLocalStorage<ExtensionContext | undefined>();
 
   function ensureManager(ctx: ExtensionContext) {
@@ -69,13 +69,12 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     return manager;
   }
 
-  function loadConfigured(ctx: ExtensionContext) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
+  function loadConfiguredEffect(ctx: ExtensionContext) {
+    return Effect.gen(function* () {
         latestContext = ctx;
         const generation = configGeneration + 1;
         configGeneration = generation;
-        config = yield* Effect.tryPromise({ try: () => loadMcpConfig({ cwd: ctx.cwd }), catch: (error) => error });
+        config = yield* loadMcpConfigEffect({ cwd: ctx.cwd });
         const activeManager = yield* Effect.sync(() => ensureManager(ctx));
         const previous = registeredToolNames;
         registeredToolNames = new Set();
@@ -83,8 +82,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         registerDynamicTools();
         deactivateTools([...previous].filter((name) => !registeredToolNames.has(name)));
         return { activeManager, generation };
-      }),
-    );
+      });
   }
 
   function connectConfiguredServers(activeManager: McpManager, generation: number) {
@@ -96,7 +94,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
   }
 
   function startBackgroundConnectionRefresh(ctx: ExtensionContext, activeManager: McpManager, generation: number) {
-    backgroundConnectionRefresh = Effect.runPromise(
+    backgroundConnectionRefresh = Effect.runFork(
       connectConfiguredServers(activeManager, generation).pipe(
         Effect.tap(() =>
           manager === activeManager && configGeneration === generation
@@ -198,8 +196,8 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     const server = optionalString(args, "server");
     const parsedArgs = parseProxyJsonArgs(optionalString(args, "args"));
 
-    if (action === "resources") return yield* Effect.tryPromise({ try: () => proxyResources(server, signal), catch: (error) => error });
-    if (action === "read-resource") return yield* Effect.tryPromise({ try: () => proxyReadResource(server, optionalString(args, "uri"), signal), catch: (error) => error });
+    if (action === "resources") return yield* proxyResourcesEffect(server, signal);
+    if (action === "read-resource") return yield* proxyReadResourceEffect(server, optionalString(args, "uri"), signal);
     if (action !== undefined && action !== "status") {
       return proxyText(`Unknown MCP action "${action}". Supported actions: status, resources, read-resource.`, {
         mode: "error",
@@ -209,58 +207,49 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     }
 
     const tool = optionalString(args, "tool");
-    if (tool) return yield* Effect.tryPromise({ try: () => proxyCall(tool, parsedArgs, server, signal), catch: (error) => error });
+    if (tool) return yield* proxyCallEffect(tool, parsedArgs, server, signal);
 
     const connect = optionalString(args, "connect");
-    if (connect) return yield* Effect.tryPromise({ try: () => proxyConnect(connect), catch: (error) => error });
+    if (connect) return yield* proxyConnectEffect(connect);
 
     const describe = optionalString(args, "describe");
-    if (describe) return yield* Effect.tryPromise({ try: () => proxyDescribe(describe, server, signal), catch: (error) => error });
+    if (describe) return yield* proxyDescribeEffect(describe, server, signal);
 
     const search = optionalString(args, "search");
-    if (search) return yield* Effect.tryPromise({ try: () => proxySearch(search, typeof args.regex === "boolean" ? args.regex : false, server, signal), catch: (error) => error });
+    if (search) return yield* proxySearchEffect(search, typeof args.regex === "boolean" ? args.regex : false, server, signal);
 
-    if (server) return yield* Effect.tryPromise({ try: () => proxyList(server, signal), catch: (error) => error });
+    if (server) return yield* proxyListEffect(server, signal);
     return proxyStatus();
       }),
     );
   }
 
-  function proxyCall(toolName: string, args: Record<string, unknown>, server: string | undefined, signal: AbortSignal | undefined) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        yield* Effect.tryPromise({ try: () => ensureProxyToolMetadata(toolName, server, { signal }), catch: (error) => error });
+  function proxyCallEffect(toolName: string, args: Record<string, unknown>, server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.gen(function* () {
+        yield* ensureProxyToolMetadataEffect(toolName, server, { signal });
         const found = findProxyTool(toolName, server);
         if ("error" in found) return proxyText(found.error, found.details);
-        return yield* Effect.tryPromise({
-          try: () =>
-            callMcpTool({
-              client: found.entry.client,
-              tool: found.entry.tool,
-              args,
-              timeout: found.entry.timeout,
-              signal,
-            }),
-          catch: (error) => error,
+        return yield* callMcpToolEffect({
+          client: found.entry.client,
+          tool: found.entry.tool,
+          args,
+          timeout: found.entry.timeout,
+          signal,
         });
-      }),
-    );
+      });
   }
 
-  function proxyConnect(server: string) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
+  function proxyConnectEffect(server: string) {
+    return Effect.gen(function* () {
         const status = yield* requireManager().connectEffect(server, { intent: "explicit", signal: undefined });
         yield* Effect.sync(() => registerDynamicTools());
         return proxyText(formatStatus(server, config.servers[server], status), { mode: "connect", server, status: status.status });
-      }),
-    );
+      });
   }
 
-  function proxyDescribe(toolName: string, server: string | undefined, signal: AbortSignal | undefined) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        yield* Effect.tryPromise({ try: () => ensureProxyToolMetadata(toolName, server, { signal }), catch: (error) => error });
+  function proxyDescribeEffect(toolName: string, server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.gen(function* () {
+        yield* ensureProxyToolMetadataEffect(toolName, server, { signal });
         const found = findProxyTool(toolName, server);
         if ("error" in found) return proxyText(found.error, found.details);
         return proxyText(formatProxyToolDescription(found.entry), {
@@ -269,16 +258,14 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
           tool: found.entry.key,
           originalName: found.entry.name,
         });
-      }),
-    );
+      });
   }
 
-  function proxySearch(query: string, regex: boolean, server: string | undefined, signal: AbortSignal | undefined) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
+  function proxySearchEffect(query: string, regex: boolean, server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.gen(function* () {
         const pattern = buildSearchPattern(query, regex);
     if ("error" in pattern) return proxyText(pattern.error, pattern.details);
-        yield* Effect.tryPromise({ try: () => ensureProxySearchMetadata(server, { signal }), catch: (error) => error });
+        yield* ensureProxySearchMetadataEffect(server, { signal });
         const matches = proxyToolEntries()
       .filter((entry) => !server || entry.server === server)
       .filter((entry) => pattern.pattern.test(`${entry.key}\n${entry.name}\n${entry.server}\n${entry.tool.description ?? ""}`))
@@ -312,13 +299,11 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
           matches: shown.map((entry) => ({ server: entry.server, tool: entry.key, name: entry.name })),
           truncated: shown.length < matches.length,
         });
-      }),
-    );
+      });
   }
 
-  function proxyList(server: string, signal: AbortSignal | undefined) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
+  function proxyListEffect(server: string, signal: AbortSignal | undefined) {
+    return Effect.gen(function* () {
         if (!config.servers[server]) {
       return proxyText(`MCP server "${server}" is not configured. Use mcp({}) to see available servers.`, {
         mode: "list",
@@ -326,7 +311,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         error: "server_not_found",
       });
     }
-    yield* Effect.tryPromise({ try: () => ensureProxyServerConnected(server, { signal }), catch: (error) => error });
+    yield* ensureProxyServerConnectedEffect(server, { signal });
     const entries = proxyToolEntries().filter((entry) => entry.server === server).sort((a, b) => a.key.localeCompare(b.key));
     if (entries.length === 0) {
       const status = requireManager().status()[server]?.status ?? "disabled";
@@ -348,15 +333,13 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
           count: entries.length,
           tools: entries.map((entry) => entry.key),
         });
-      }),
-    );
+      });
   }
 
-  function proxyResources(server: string | undefined, signal: AbortSignal | undefined) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        if (server) yield* Effect.tryPromise({ try: () => ensureProxyServerConnected(server, { signal }), catch: (error) => error });
-        else yield* Effect.tryPromise({ try: () => ensureProxyServersConnected({ signal }), catch: (error) => error });
+  function proxyResourcesEffect(server: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.gen(function* () {
+        if (server) yield* ensureProxyServerConnectedEffect(server, { signal });
+        else yield* ensureProxyServersConnectedEffect({ signal });
     const resourceServers = resourceServerNames();
     if (server && !resourceServers.includes(server)) {
       return proxyText(`MCP server "${server}" does not support resources. Available resource servers: ${resourceServers.join(", ") || "none"}.`, {
@@ -380,24 +363,21 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
           failures: result.failures.length,
           ...(server ? { server } : {}),
         });
-      }),
-    );
+      });
   }
 
-  function proxyReadResource(server: string | undefined, uri: string | undefined, signal: AbortSignal | undefined) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
+  function proxyReadResourceEffect(server: string | undefined, uri: string | undefined, signal: AbortSignal | undefined) {
+    return Effect.gen(function* () {
         if (!server) return proxyText("read-resource requires `server`.", { mode: "read-resource", error: "missing_server" });
     if (!uri) return proxyText("read-resource requires `uri`.", { mode: "read-resource", server, error: "missing_uri" });
-    yield* Effect.tryPromise({ try: () => ensureProxyServerConnected(server, { signal }), catch: (error) => error });
+    yield* ensureProxyServerConnectedEffect(server, { signal });
     const content = yield* requireManager().readResourceEffect(server, uri, { signal });
     const formatted = formatResourceContent(server, uri, content);
         return {
           content: [{ type: "text" as const, text: formatted.text }, ...formatted.images],
           details: { mode: "read-resource", server, uri, contents: formatted.count, images: formatted.images.length },
         };
-      }),
-    );
+      });
   }
 
   function proxyStatus() {
@@ -422,48 +402,31 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     });
   }
 
-  async function ensureProxyToolMetadata(toolName: string, server: string | undefined, options: CancellableOptions) {
-    if (server) {
-      await ensureProxyServerConnected(server, options);
-      return;
-    }
-
+  function ensureProxyToolMetadataEffect(toolName: string, server: string | undefined, options: CancellableOptions) {
+    if (server) return ensureProxyServerConnectedEffect(server, options);
     const found = findProxyTool(toolName, undefined);
-    if (!("error" in found)) return;
-    await ensureProxyServersConnected(options);
+    return "error" in found ? ensureProxyServersConnectedEffect(options) : Effect.void;
   }
 
-  async function ensureProxySearchMetadata(server: string | undefined, options: CancellableOptions) {
-    if (server) {
-      await ensureProxyServerConnected(server, options);
-      return;
-    }
-    await ensureProxyServersConnected(options);
+  function ensureProxySearchMetadataEffect(server: string | undefined, options: CancellableOptions) {
+    return server ? ensureProxyServerConnectedEffect(server, options) : ensureProxyServersConnectedEffect(options);
   }
 
-  function ensureProxyServerConnected(server: string, options: CancellableOptions) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        if (!config.servers[server]) return;
-        yield* requireManager().connectEffect(server, { intent: "automatic", signal: options.signal });
-        yield* Effect.sync(() => {
-          registerDynamicTools();
-          updateLatestMcpStatus();
-        });
-      }),
-    );
+  function ensureProxyServerConnectedEffect(server: string, options: CancellableOptions) {
+    return Effect.gen(function* () {
+      if (!config.servers[server]) return;
+      yield* requireManager().connectEffect(server, { intent: "automatic", signal: options.signal });
+      registerDynamicTools();
+      updateLatestMcpStatus();
+    });
   }
 
-  function ensureProxyServersConnected(options: CancellableOptions) {
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        yield* requireManager().connectAllEffect({ intent: "automatic", signal: options.signal });
-        yield* Effect.sync(() => {
-          registerDynamicTools();
-          updateLatestMcpStatus();
-        });
-      }),
-    );
+  function ensureProxyServersConnectedEffect(options: CancellableOptions) {
+    return Effect.gen(function* () {
+      yield* requireManager().connectAllEffect({ intent: "automatic", signal: options.signal });
+      registerDynamicTools();
+      updateLatestMcpStatus();
+    });
   }
 
   function proxyToolEntries() {
@@ -601,7 +564,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     Effect.runPromise(
       Effect.gen(function* () {
         latestContext = ctx;
-        const loaded = yield* Effect.tryPromise({ try: () => loadConfigured(ctx), catch: (error) => error });
+        const loaded = yield* loadConfiguredEffect(ctx);
         yield* Effect.sync(() => updateMcpStatus(ctx));
         if (startupMode(config) === "eager") {
           yield* Effect.sync(() => startBackgroundConnectionRefresh(ctx, loaded.activeManager, loaded.generation));
@@ -617,13 +580,8 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         const pendingConnectionRefresh = backgroundConnectionRefresh;
         const activeManager = manager;
         backgroundConnectionRefresh = undefined;
+        if (pendingConnectionRefresh) yield* Fiber.interrupt(pendingConnectionRefresh);
         if (activeManager) yield* activeManager.closeEffect();
-        if (pendingConnectionRefresh) {
-          yield* Effect.race(
-            Effect.tryPromise({ try: () => pendingConnectionRefresh, catch: (error) => error }),
-            Effect.succeed(undefined),
-          );
-        }
         manager = undefined;
         registeredToolNames = new Set();
       }),
@@ -632,21 +590,19 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("mcp", {
     description: "Open the interactive MCP server manager",
-    handler: async (_args, ctx) => {
-      await runMcpCommand(ctx, {
-        ensureManager: async (commandContext) => ensureManager(commandContext),
+    handler: (_args, ctx) =>
+      runMcpCommand(ctx, {
+        ensureManager: (commandContext) => Effect.sync(() => ensureManager(commandContext)),
         getConfig: () => config,
         reload: (commandContext) =>
-          Effect.runPromise(
             Effect.gen(function* () {
-              const loaded = yield* Effect.tryPromise({ try: () => loadConfigured(commandContext), catch: (error) => error });
+              const loaded = yield* loadConfiguredEffect(commandContext);
               yield* loaded.activeManager.connectAllEffect({ intent: "explicit", signal: undefined });
               yield* Effect.sync(() => {
                 registerDynamicTools();
                 updateMcpStatus(commandContext);
               });
             }),
-          ),
         refreshRuntime: (commandContext) => {
           registerDynamicTools();
           updateMcpStatus(commandContext);
@@ -654,8 +610,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         showStatus: (text) => showCommandMessage(pi, "MCP Servers", text),
         showAuthorizationUrl: (url) => showCommandMessage(pi, "Open MCP OAuth URL", url),
         sendUserMessage: (text) => pi.sendUserMessage(text),
-      });
-    },
+      }),
   });
 
   function requireManager() {

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { Effect } from "effect";
+import { Effect, Fiber } from "effect";
 import { pathToFileURL } from "node:url";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Client, StreamableHTTPClientTransport, SSEClientTransport, UnauthorizedError } from "@modelcontextprotocol/client";
@@ -23,9 +23,9 @@ import { randomHex } from "./random.js";
 import { DEFAULT_TIMEOUT } from "./request-limits.js";
 import { mcpToolKey, sanitizeName } from "./tool-names.js";
 import { withTimeoutEffect } from "./timeout.js";
-import { listPromptsEffect, listResourcesEffect, listTools } from "./catalog.js";
+import { listPromptsEffect, listResourcesEffect, listToolsEffect } from "./catalog.js";
 import { McpOAuthProvider } from "./oauth-provider.js";
-import { McpManagerError } from "./errors.js";
+import { McpManagerError, OAuthError } from "./errors.js";
 import {
   NodeOAuthCallbackRuntime,
   type OAuthCallbackRuntime,
@@ -51,6 +51,12 @@ interface ManagedClient {
   transport: Transport;
   config: McpServerConfig;
   tools: Tool[];
+}
+
+interface ConnectionResult {
+  readonly status: McpStatus;
+  readonly client?: Client;
+  readonly transport?: Transport;
 }
 
 /** Connected MCP client snapshot exposed for extension integration and tests. */
@@ -134,7 +140,7 @@ export class McpManager {
       yield* self.oauthCallbacks.closeEffect();
       yield* self.closePendingOAuthTransportsEffect();
       yield* self.closeClientsEffect();
-      self.connectionAttempts.clear();
+      yield* self.closeConnectionAttemptsEffect();
       self.statuses.clear();
       self.config = cloneMcpConfig(config);
 
@@ -267,7 +273,7 @@ export class McpManager {
       const existing = self.connectionAttempts.get(name);
       if (existing) return waitForConnectAttemptEffect(existing, options.signal);
       const revision = self.revision;
-      const attempt = self.connectFresh(name, serverConfig, revision, { signal: options.signal }).finally(() => {
+      const attempt = Effect.runPromise(self.connectFreshEffect(name, serverConfig, revision, { signal: options.signal })).finally(() => {
         if (self.connectionAttempts.get(name) === attempt) self.connectionAttempts.delete(name);
       });
       self.connectionAttempts.set(name, attempt);
@@ -286,7 +292,7 @@ export class McpManager {
     return Effect.gen(function* () {
       if (!self.config.servers[name]) return yield* Effect.fail(new McpManagerError({ message: `MCP server not found: ${name}` }));
       self.manuallyDisconnected.add(name);
-      yield* Effect.tryPromise({ try: () => self.disconnectClient(name, { status: "disabled" }), catch: (error) => error });
+      yield* self.disconnectClientEffect(name, { status: "disabled" });
       yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
       yield* self.emitStatusChangedEffect();
     });
@@ -382,32 +388,41 @@ export class McpManager {
   }
 
   /** Runs the OAuth flow for one remote MCP server and reconnects it after successful authorization. */
-  async authenticate(name: string, onAuthorizationUrl?: (url: string) => void | Promise<void>): Promise<McpStatus> {
-    const result = await this.startAuth(name);
-    if (!result.authorizationUrl) {
-      this.oauthCallbacks.cancel(name);
-      await result.callbackPromise.catch(() => undefined);
-      if (!result.client) return { status: "failed", error: "OAuth did not return a connected client" } satisfies McpStatus;
-      const serverConfig = this.requireRemote(name);
-      const tools = result.client.getServerCapabilities()?.tools
-        ? await listTools(result.client, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, undefined)
-        : [];
-      if (!result.transport) return { status: "failed", error: "OAuth did not return a connected transport" } satisfies McpStatus;
-      await this.storeClient(name, result.client, result.transport, serverConfig, tools);
-      await this.auth.clearOAuthState(name);
-      return this.statuses.get(name) ?? { status: "failed", error: "OAuth did not store a connected status" };
-    }
+  authenticate(name: string, onAuthorizationUrl?: (url: string) => void | Promise<void>): Promise<McpStatus> {
+    return Effect.runPromise(this.authenticateEffect(name, onAuthorizationUrl));
+  }
 
-    await this.openAuthorizationUrl(result.authorizationUrl, onAuthorizationUrl);
+  /** Effect-native OAuth authorization workflow. */
+  authenticateEffect(name: string, onAuthorizationUrl?: (url: string) => void | Promise<void>) {
+    const self = this;
+    return Effect.gen(function* () {
+      const result = yield* self.startAuthEffect(name);
+      if (!result.authorizationUrl) {
+        self.oauthCallbacks.cancel(name);
+        yield* Fiber.await(result.callbackFiber);
+        const client = result.client;
+        if (!client) return { status: "failed", error: "OAuth did not return a connected client" } satisfies McpStatus;
+        const serverConfig = self.requireRemote(name);
+        const tools = client.getServerCapabilities()?.tools
+          ? yield* listToolsEffect(client, serverConfig.timeout ?? self.config.timeout ?? DEFAULT_TIMEOUT, undefined)
+          : [];
+        const transport = result.transport;
+        if (!transport) return { status: "failed", error: "OAuth did not return a connected transport" } satisfies McpStatus;
+        yield* self.storeClientEffect(name, client, transport, serverConfig, tools);
+        yield* self.auth.clearOAuthStateEffect(name);
+        return self.statuses.get(name) ?? ({ status: "failed", error: "OAuth did not store a connected status" } satisfies McpStatus);
+      }
 
-    const callbackParams = await result.callbackPromise;
-    const storedState = await this.auth.getOAuthState(name);
-    if (storedState !== result.oauthState || callbackParams.get("state") !== result.oauthState) {
-      await this.auth.clearOAuthState(name);
-      throw new Error("OAuth state mismatch");
-    }
-    await this.auth.clearOAuthState(name);
-    return this.finishAuth(name, callbackParams);
+      yield* self.openAuthorizationUrlEffect(result.authorizationUrl, onAuthorizationUrl);
+      const callbackParams = yield* Fiber.join(result.callbackFiber);
+      const storedState = yield* self.auth.getOAuthStateEffect(name);
+      if (storedState !== result.oauthState || callbackParams.get("state") !== result.oauthState) {
+        yield* self.auth.clearOAuthStateEffect(name);
+        return yield* Effect.fail(new OAuthError({ message: "OAuth state mismatch" }));
+      }
+      yield* self.auth.clearOAuthStateEffect(name);
+      return yield* self.finishAuthEffect(name, callbackParams);
+    });
   }
 
   /** Removes stored OAuth state and cancels any in-flight authorization for one MCP server. */
@@ -451,220 +466,152 @@ export class McpManager {
       yield* self.oauthCallbacks.closeEffect();
       yield* self.closePendingOAuthTransportsEffect();
       yield* self.closeClientsEffect();
-      self.connectionAttempts.clear();
+      yield* self.closeConnectionAttemptsEffect();
     });
   }
 
-  private async connectFresh(
-    name: string,
-    serverConfig: McpServerConfig,
-    revision: number,
-    options: CancellableOptions,
-  ): Promise<McpStatus> {
-    options.signal?.throwIfAborted();
-
-    await this.disconnectClient(name, { status: "connecting" });
-
-    const result =
-      serverConfig.type === "local"
-        ? await this.connectLocal(name, serverConfig, options)
-        : await this.connectRemote(name, serverConfig, options);
-
-    if (options.signal?.aborted) {
-      if (result.client && result.transport) await safeCloseClient(result.client, result.transport);
-      options.signal.throwIfAborted();
-    }
-
-    if (!this.isCurrentRevision(revision)) {
-      if (result.client && result.transport) await safeCloseClient(result.client, result.transport);
-      return { status: "disconnected" };
-    }
-
-    if (this.manuallyDisconnected.has(name)) {
-      if (result.client && result.transport) await safeCloseClient(result.client, result.transport);
-      const disabled = { status: "disabled" as const };
-      this.statuses.set(name, disabled);
-      return disabled;
-    }
-
-    this.statuses.set(name, result.status);
-
-    if (!result.client || !result.transport) {
-      await this.options.onToolsChanged?.(name);
-      await this.emitStatusChanged();
+  private connectFreshEffect(name: string, serverConfig: McpServerConfig, revision: number, options: CancellableOptions) {
+    const self = this;
+    return Effect.gen(function* () {
+      options.signal?.throwIfAborted();
+      yield* self.disconnectClientEffect(name, { status: "connecting" });
+      const result = yield* (serverConfig.type === "local"
+        ? self.connectLocalEffect(name, serverConfig, options)
+        : self.connectRemoteEffect(name, serverConfig, options));
+      if (options.signal?.aborted) {
+        if (result.client && result.transport) yield* safeCloseClientEffect(result.client, result.transport);
+        options.signal.throwIfAborted();
+      }
+      if (!self.isCurrentRevision(revision)) {
+        if (result.client && result.transport) yield* safeCloseClientEffect(result.client, result.transport);
+        return { status: "disconnected" as const };
+      }
+      if (self.manuallyDisconnected.has(name)) {
+        if (result.client && result.transport) yield* safeCloseClientEffect(result.client, result.transport);
+        const disabled = { status: "disabled" as const };
+        self.statuses.set(name, disabled);
+        return disabled;
+      }
+      self.statuses.set(name, result.status);
+      if (!result.client || !result.transport) {
+        yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
+        yield* self.emitStatusChangedEffect();
+        return result.status;
+      }
+      const client = result.client;
+      const transport = result.transport;
+      const tools = yield* (client.getServerCapabilities()?.tools
+        ? listToolsEffect(client, serverConfig.timeout ?? self.config.timeout ?? DEFAULT_TIMEOUT, options.signal)
+        : Effect.succeed<Tool[]>([])).pipe(
+          Effect.catch((error) => safeCloseClientEffect(client, transport).pipe(Effect.andThen(Effect.fail(error)))),
+        );
+      if (options.signal?.aborted) {
+        yield* safeCloseClientEffect(client, transport);
+        options.signal.throwIfAborted();
+      }
+      if (!self.isCurrentRevision(revision)) {
+        yield* safeCloseClientEffect(client, transport);
+        return { status: "disconnected" as const };
+      }
+      if (self.manuallyDisconnected.has(name)) {
+        yield* safeCloseClientEffect(client, transport);
+        const disabled = { status: "disabled" as const };
+        self.statuses.set(name, disabled);
+        return disabled;
+      }
+      const collision = findToolKeyCollision(new Map(self.clients).set(name, { client, transport, config: serverConfig, tools }));
+      if (collision) {
+        const status = { status: "failed" as const, error: collision.message };
+        yield* safeCloseClientEffect(client, transport);
+        self.statuses.set(name, status);
+        yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
+        yield* self.emitStatusChangedEffect();
+        return status;
+      }
+      self.clients.set(name, { client, transport, config: serverConfig, tools });
+      self.watch(name, client);
+      yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
+      yield* self.emitStatusChangedEffect();
       return result.status;
-    }
-
-    let tools: Tool[];
-    try {
-      tools = result.client.getServerCapabilities()?.tools
-        ? await listTools(
-            result.client,
-            serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT,
-            options.signal,
-          )
-        : [];
-    } catch (error: unknown) {
-      await safeCloseClient(result.client, result.transport);
-      throw error;
-    }
-
-    if (options.signal?.aborted) {
-      await safeCloseClient(result.client, result.transport);
-      options.signal.throwIfAborted();
-    }
-
-    if (!this.isCurrentRevision(revision)) {
-      await safeCloseClient(result.client, result.transport);
-      return { status: "disconnected" };
-    }
-
-    if (this.manuallyDisconnected.has(name)) {
-      await safeCloseClient(result.client, result.transport);
-      const disabled = { status: "disabled" as const };
-      this.statuses.set(name, disabled);
-      return disabled;
-    }
-
-    const collision = findToolKeyCollision(
-      new Map(this.clients).set(name, {
-        client: result.client,
-        transport: result.transport,
-        config: serverConfig,
-        tools,
-      }),
-    );
-
-    if (collision) {
-      const status = { status: "failed" as const, error: collision.message };
-      await safeCloseClient(result.client, result.transport);
-      this.statuses.set(name, status);
-      await this.options.onToolsChanged?.(name);
-      await this.emitStatusChanged();
-      return status;
-    }
-
-    this.clients.set(name, {
-      client: result.client,
-      transport: result.transport,
-      config: serverConfig,
-      tools,
     });
-    this.watch(name, result.client);
-    await this.options.onToolsChanged?.(name);
-    await this.emitStatusChanged();
-    return result.status;
   }
 
-  private async connectLocal(name: string, serverConfig: Extract<McpServerConfig, { type: "local" }>, options: CancellableOptions) {
+  private connectLocalEffect(name: string, serverConfig: Extract<McpServerConfig, { type: "local" }>, options: CancellableOptions) {
     const [command, ...args] = serverConfig.command;
-    if (!command) return { status: { status: "failed" as const, error: "Local MCP command is empty" } };
+    if (!command) return Effect.succeed<ConnectionResult>({ status: { status: "failed", error: "Local MCP command is empty" } });
     const cwd = serverConfig.cwd ? path.resolve(this.options.cwd, resolveHome(serverConfig.cwd)) : this.options.cwd;
     const transport = new StdioClientTransport({
       stderr: "pipe",
       command,
       args,
       cwd,
-      env: {
-        ...definedProcessEnv(),
-        ...(command === "opencode" ? { BUN_BE_BUN: "1" } : {}),
-        ...serverConfig.environment,
-      },
+      env: { ...definedProcessEnv(), ...(command === "opencode" ? { BUN_BE_BUN: "1" } : {}), ...serverConfig.environment },
     });
-
-    try {
-      const client = await this.connectTransport(
-        name,
-        transport,
-        serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT,
-        options,
-      );
-      return { client, transport, status: { status: "connected" as const } };
-    } catch (error: unknown) {
-      await safeCloseTransport(transport);
-      if (isAbortError(error)) throw error;
-      return { status: { status: "failed" as const, error: errorMessage(error) } };
-    }
+    return Effect.result(
+      this.connectTransportEffect(name, transport, serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options),
+    ).pipe(
+      Effect.flatMap((result) => {
+        if (result._tag === "Success") {
+          return Effect.succeed<ConnectionResult>({ client: result.success, transport, status: { status: "connected" } });
+        }
+        return safeCloseTransportEffect(transport).pipe(
+          Effect.andThen(
+            isAbortError(result.failure)
+              ? Effect.fail(result.failure)
+              : Effect.succeed<ConnectionResult>({ status: { status: "failed", error: errorMessage(result.failure) } }),
+          ),
+        );
+      }),
+    );
   }
 
-  private async connectRemote(name: string, serverConfig: Extract<McpServerConfig, { type: "remote" }>, options: CancellableOptions) {
-    const url = URL.canParse(serverConfig.url) ? new URL(serverConfig.url) : undefined;
-    if (!url) return { status: { status: "failed" as const, error: `Invalid MCP URL for "${name}"` } };
-
-    const oauthDisabled = serverConfig.oauth === false;
-    const authProvider = oauthDisabled
-      ? undefined
-      : this.trackOAuthProvider(name, new McpOAuthProvider(
-          name,
-          serverConfig.url,
-          typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined,
-          { onRedirect: async () => undefined },
-          this.auth,
-        ));
-
-    const transports: Array<{ name: string; transport: TransportWithAuth }> = [
-      {
-        name: "StreamableHTTP",
-        transport: new StreamableHTTPClientTransport(url, transportOptions(authProvider, serverConfig.headers)),
-      },
-      {
-        name: "SSE",
-        transport: new SSEClientTransport(url, transportOptions(authProvider, serverConfig.headers)),
-      },
-    ];
-
-    let lastStatus: McpStatus | undefined;
-    for (const candidate of transports) {
-      try {
-        const client = await this.connectTransport(
-          name,
-          candidate.transport,
-          serverConfig.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT,
-          options,
+  private connectRemoteEffect(name: string, serverConfig: Extract<McpServerConfig, { type: "remote" }>, options: CancellableOptions) {
+    const self = this;
+    return Effect.gen(function* () {
+      const url = URL.canParse(serverConfig.url) ? new URL(serverConfig.url) : undefined;
+      if (!url) return { status: { status: "failed", error: `Invalid MCP URL for "${name}"` } } satisfies ConnectionResult;
+      const authProvider = serverConfig.oauth === false
+        ? undefined
+        : self.trackOAuthProvider(name, new McpOAuthProvider(
+            name,
+            serverConfig.url,
+            typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined,
+            { onRedirect: () => undefined },
+            self.auth,
+          ));
+      const transports: TransportWithAuth[] = [
+        new StreamableHTTPClientTransport(url, transportOptions(authProvider, serverConfig.headers)),
+        new SSEClientTransport(url, transportOptions(authProvider, serverConfig.headers)),
+      ];
+      let lastStatus: McpStatus | undefined;
+      for (const transport of transports) {
+        const result = yield* Effect.result(
+          self.connectTransportEffect(name, transport, serverConfig.timeout ?? self.config.timeout ?? DEFAULT_TIMEOUT, options),
         );
-        return { client, transport: candidate.transport, status: { status: "connected" as const } };
-      } catch (error: unknown) {
-        if (isAbortError(error)) {
-          await safeCloseTransport(candidate.transport);
-          throw error;
-        }
-
-        const message = errorMessage(error);
-        const isAuthError = error instanceof UnauthorizedError || (!!authProvider && /oauth|authorization|unauthorized/i.test(message));
+        if (result._tag === "Success") return { client: result.success, transport, status: { status: "connected" } } satisfies ConnectionResult;
+        yield* safeCloseTransportEffect(transport);
+        if (isAbortError(result.failure)) return yield* Effect.fail(result.failure);
+        const message = errorMessage(result.failure);
+        const isAuthError = result.failure instanceof UnauthorizedError || (!!authProvider && /oauth|authorization|unauthorized/i.test(message));
         if (isAuthError) {
-          await safeCloseTransport(candidate.transport);
           if (/registration|client_id/i.test(message)) {
-            lastStatus = {
-              status: "needs_client_registration",
-              error: "Server does not support dynamic client registration. Provide oauth.clientId in config.",
-            };
+            lastStatus = { status: "needs_client_registration", error: "Server does not support dynamic client registration. Provide oauth.clientId in config." };
           } else {
-            this.pendingOAuthTransports.set(name, candidate.transport);
+            self.pendingOAuthTransports.set(name, transport);
             lastStatus = { status: "needs_auth" };
           }
           break;
         }
-        await safeCloseTransport(candidate.transport);
         lastStatus = { status: "failed", error: message };
       }
-    }
-
-    return { status: lastStatus ?? { status: "failed", error: "Unknown MCP connection error" } };
-  }
-
-  private connectTransport(name: string, transport: Transport, timeout: number, options: CancellableOptions) {
-    return Effect.runPromise(this.connectTransportEffect(name, transport, timeout, options));
+      return { status: lastStatus ?? { status: "failed", error: "Unknown MCP connection error" } } satisfies ConnectionResult;
+    });
   }
 
   private connectTransportEffect(name: string, transport: Transport, timeout: number, options: CancellableOptions) {
     options.signal?.throwIfAborted();
     const client = this.createClient(name);
-    return withTimeoutEffect(
-      Effect.tryPromise({ try: () => client.connect(transport), catch: (error) => error }),
-      timeout,
-      "MCP connect",
-      options,
-    ).pipe(Effect.as(client));
+    return withTimeoutEffect(client.connect(transport), timeout, "MCP connect", options).pipe(Effect.as(client));
   }
 
   private createClient(server = "unknown") {
@@ -714,80 +661,86 @@ export class McpManager {
     if (!client.getServerCapabilities()?.tools) return;
   }
 
-  private async handleToolListChanged(name: string, client: Client) {
-    const managed = this.clients.get(name);
-    if (!managed || managed.client !== client || this.statuses.get(name)?.status !== "connected") return;
-    const timeout = managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT;
-    const tools = await listTools(client, timeout, undefined);
-    const collision = findToolKeyCollision(new Map(this.clients).set(name, { ...managed, tools }));
-    if (collision) {
-      this.clients.delete(name);
-      this.statuses.set(name, { status: "failed", error: collision.message });
-      await safeCloseClient(managed.client, managed.transport);
-      await this.options.onToolsChanged?.(name);
-      await this.emitStatusChanged();
-      return;
-    }
-    managed.tools = tools;
-    await this.options.onToolsChanged?.(name);
+  private handleToolListChanged(name: string, client: Client) {
+    return Effect.runPromise(this.handleToolListChangedEffect(name, client));
   }
 
-  private async startAuth(name: string) {
-    const serverConfig = this.requireRemote(name);
-    if (serverConfig.oauth === false) throw new Error(`MCP server ${name} has OAuth disabled`);
-
-    const oauthConfig = typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined;
-    const redirectUri =
-      oauthConfig?.redirectUri ??
-      (oauthConfig?.callbackPort ? `http://127.0.0.1:${oauthConfig.callbackPort}/mcp/oauth/callback` : undefined);
-    const oauthState = randomHex();
-    await this.oauthCallbacks.start(redirectUri);
-    const callbackPromise = this.oauthCallbacks.waitForResult(name, oauthState);
-    void callbackPromise.catch(() => undefined);
-
-    let capturedUrl: URL | undefined;
-    let transport: TransportWithAuth | undefined;
-    try {
-      await this.auth.updateOAuthState(name, oauthState);
-      const authProvider = this.trackOAuthProvider(name, new McpOAuthProvider(
-        name,
-        serverConfig.url,
-        oauthProviderConfig(oauthConfig, redirectUri),
-        {
-          onRedirect: async (url) => {
-            capturedUrl = url;
-          },
-        },
-        this.auth,
-      ));
-
-      transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions(authProvider, serverConfig.headers));
-      const client = this.createClient(name);
-      await client.connect(transport);
-      return { authorizationUrl: "", oauthState, callbackPromise, client, transport };
-    } catch (error) {
-      if (error instanceof UnauthorizedError && capturedUrl && transport) {
-        this.pendingOAuthTransports.set(name, transport);
-        return { authorizationUrl: capturedUrl.toString(), oauthState, callbackPromise };
+  private handleToolListChangedEffect(name: string, client: Client) {
+    const self = this;
+    return Effect.gen(function* () {
+      const managed = self.clients.get(name);
+      if (!managed || managed.client !== client || self.statuses.get(name)?.status !== "connected") return;
+      const timeout = managed.config.timeout ?? self.config.timeout ?? DEFAULT_TIMEOUT;
+      const tools = yield* listToolsEffect(client, timeout, undefined);
+      const collision = findToolKeyCollision(new Map(self.clients).set(name, { ...managed, tools }));
+      if (collision) {
+        self.clients.delete(name);
+        self.statuses.set(name, { status: "failed", error: collision.message });
+        yield* safeCloseClientEffect(managed.client, managed.transport);
+        yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
+        yield* self.emitStatusChangedEffect();
+        return;
       }
-      if (transport) await safeCloseTransport(transport);
-      this.oauthCallbacks.cancel(name);
-      await callbackPromise.catch(() => undefined);
-      throw error;
-    }
+      managed.tools = tools;
+      yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
+    });
   }
 
-  private async finishAuth(name: string, callbackParams: URLSearchParams) {
-    const transport = this.pendingOAuthTransports.get(name);
-    if (!transport) throw new Error(`No pending OAuth flow for MCP server: ${name}`);
+  private startAuthEffect(name: string) {
+    const self = this;
+    return Effect.gen(function* () {
+      const serverConfig = yield* Effect.try({ try: () => self.requireRemote(name), catch: (error) => error });
+      if (serverConfig.oauth === false) return yield* Effect.fail(new OAuthError({ message: `MCP server ${name} has OAuth disabled` }));
+      const oauthConfig = typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined;
+      const redirectUri = oauthConfig?.redirectUri ??
+        (oauthConfig?.callbackPort ? `http://127.0.0.1:${oauthConfig.callbackPort}/mcp/oauth/callback` : undefined);
+      const oauthState = randomHex();
+      yield* self.oauthCallbacks.startEffect(redirectUri);
+      const callbackFiber = Effect.runFork(self.oauthCallbacks.waitForResultEffect(name, oauthState));
+      let capturedUrl: URL | undefined;
+      let transport: TransportWithAuth | undefined;
+      const flow = Effect.gen(function* () {
+        yield* self.auth.updateOAuthStateEffect(name, oauthState);
+        const authProvider = self.trackOAuthProvider(name, new McpOAuthProvider(
+          name,
+          serverConfig.url,
+          oauthProviderConfig(oauthConfig, redirectUri),
+          { onRedirect: (url) => { capturedUrl = url; } },
+          self.auth,
+        ));
+        transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions(authProvider, serverConfig.headers));
+        const client = self.createClient(name);
+        yield* Effect.tryPromise({ try: () => client.connect(transport!), catch: (error) => error });
+        return { authorizationUrl: "", oauthState, callbackFiber, client, transport };
+      });
+      return yield* flow.pipe(
+        Effect.catch((error) => {
+          if (error instanceof UnauthorizedError && capturedUrl && transport) {
+            self.pendingOAuthTransports.set(name, transport);
+            return Effect.succeed({ authorizationUrl: capturedUrl.toString(), oauthState, callbackFiber, client: undefined, transport: undefined });
+          }
+          const cleanup = transport ? safeCloseTransportEffect(transport) : Effect.void;
+          return cleanup.pipe(
+            Effect.andThen(Effect.sync(() => self.oauthCallbacks.cancel(name))),
+            Effect.andThen(Fiber.await(callbackFiber)),
+            Effect.andThen(Effect.fail(error)),
+          );
+        }),
+      );
+    });
+  }
 
-    try {
-      await transport.finishAuth(callbackParams);
-      const exchangedEntry = await this.auth.get(name);
-      await this.auth.clearCodeVerifier(name);
-      if (this.pendingOAuthTransports.get(name) === transport) this.pendingOAuthTransports.delete(name);
-      await safeCloseTransport(transport);
-      const status = await this.connect(name, { intent: "explicit", signal: undefined });
+  private finishAuthEffect(name: string, callbackParams: URLSearchParams) {
+    const self = this;
+    const transport = this.pendingOAuthTransports.get(name);
+    if (!transport) return Effect.fail(new OAuthError({ message: `No pending OAuth flow for MCP server: ${name}` }));
+    const flow = Effect.gen(function* () {
+      yield* Effect.tryPromise({ try: () => transport.finishAuth(callbackParams), catch: (error) => error });
+      const exchangedEntry = yield* self.auth.getEffect(name);
+      yield* self.auth.clearCodeVerifierEffect(name);
+      if (self.pendingOAuthTransports.get(name) === transport) self.pendingOAuthTransports.delete(name);
+      yield* safeCloseTransportEffect(transport);
+      const status = yield* self.connectEffect(name, { intent: "explicit", signal: undefined });
       if (status.status === "needs_auth" && exchangedEntry?.tokens) {
         return {
           status: "failed",
@@ -795,11 +748,16 @@ export class McpManager {
         } satisfies McpStatus;
       }
       return status;
-    } catch (error) {
-      if (this.pendingOAuthTransports.get(name) === transport) this.pendingOAuthTransports.delete(name);
-      await safeCloseTransport(transport);
-      return { status: "failed", error: errorMessage(error) } satisfies McpStatus;
-    }
+    });
+    return Effect.result(flow).pipe(
+      Effect.flatMap((result) => {
+        if (result._tag === "Success") return Effect.succeed(result.success);
+        if (self.pendingOAuthTransports.get(name) === transport) self.pendingOAuthTransports.delete(name);
+        return safeCloseTransportEffect(transport).pipe(
+          Effect.as({ status: "failed", error: errorMessage(result.failure) } satisfies McpStatus),
+        );
+      }),
+    );
   }
 
   private trackOAuthProvider(server: string, provider: McpOAuthProvider): McpOAuthProvider {
@@ -826,36 +784,44 @@ export class McpManager {
     return serverConfig;
   }
 
-  private async storeClient(name: string, client: Client, transport: Transport, config: McpServerConfig, tools: Tool[]) {
-    await this.disconnectClient(name, { status: "connected" });
-    const collision = findToolKeyCollision(new Map(this.clients).set(name, { client, transport, config, tools }));
-    if (collision) {
-      await safeCloseClient(client, transport);
-      this.statuses.set(name, { status: "failed", error: collision.message });
-      await this.emitStatusChanged();
-      return;
-    }
-    this.statuses.set(name, { status: "connected" });
-    this.clients.set(name, { client, transport, config, tools });
-    this.watch(name, client);
-    await this.options.onToolsChanged?.(name);
-    await this.emitStatusChanged();
+  private storeClientEffect(name: string, client: Client, transport: Transport, config: McpServerConfig, tools: Tool[]) {
+    const self = this;
+    return Effect.gen(function* () {
+      yield* self.disconnectClientEffect(name, { status: "connected" });
+      const collision = findToolKeyCollision(new Map(self.clients).set(name, { client, transport, config, tools }));
+      if (collision) {
+        yield* safeCloseClientEffect(client, transport);
+        self.statuses.set(name, { status: "failed", error: collision.message });
+        yield* self.emitStatusChangedEffect();
+        return;
+      }
+      self.statuses.set(name, { status: "connected" });
+      self.clients.set(name, { client, transport, config, tools });
+      self.watch(name, client);
+      yield* Effect.tryPromise({ try: () => Promise.resolve(self.options.onToolsChanged?.(name)), catch: (error) => error });
+      yield* self.emitStatusChangedEffect();
+    });
   }
 
-  private async handleClientClosed(name: string, client: Client) {
+  private handleClientClosed(name: string, client: Client) {
+    return Effect.runPromise(this.handleClientClosedEffect(name, client));
+  }
+
+  private handleClientClosedEffect(name: string, client: Client) {
     const managed = this.clients.get(name);
-    if (managed?.client !== client) return;
+    if (managed?.client !== client) return Effect.void;
     this.clients.delete(name);
     this.statuses.set(name, { status: "failed", error: "Connection closed" });
-    await this.options.onToolsChanged?.(name);
-    await this.emitStatusChanged();
+    return Effect.tryPromise({ try: () => Promise.resolve(this.options.onToolsChanged?.(name)), catch: (error) => error }).pipe(
+      Effect.andThen(this.emitStatusChangedEffect()),
+    );
   }
 
-  private async disconnectClient(name: string, status: McpStatus) {
+  private disconnectClientEffect(name: string, status: McpStatus) {
     const managed = this.clients.get(name);
     this.clients.delete(name);
     this.statuses.set(name, status);
-    if (managed) await safeCloseClient(managed.client, managed.transport);
+    return managed ? safeCloseClientEffect(managed.client, managed.transport) : Effect.void;
   }
 
   private closePendingOAuthTransportsEffect() {
@@ -877,8 +843,8 @@ export class McpManager {
     );
   }
 
-  private emitStatusChanged() {
-    return Effect.runPromise(this.emitStatusChangedEffect());
+  private closeConnectionAttemptsEffect() {
+    return Effect.sync(() => this.connectionAttempts.clear());
   }
 
   private emitStatusChangedEffect() {
@@ -903,32 +869,35 @@ export class McpManager {
     return !isConfigDisabled(config);
   }
 
-  private async openAuthorizationUrl(url: string, onAuthorizationUrl?: (url: string) => void | Promise<void>) {
-    if (this.options.openAuthorizationUrl) {
-      await this.options.openAuthorizationUrl(url);
-      return;
+  private openAuthorizationUrlEffect(url: string, onAuthorizationUrl?: (url: string) => void | Promise<void>) {
+    const configuredOpen = this.options.openAuthorizationUrl;
+    if (configuredOpen) {
+      return Effect.tryPromise({ try: () => Promise.resolve(configuredOpen(url)), catch: (error) => error });
     }
-
-    try {
-      const subprocess = await open(url);
-      await Effect.runPromise(
+    const launch = Effect.tryPromise({ try: () => open(url), catch: (error) => error }).pipe(
+      Effect.flatMap((subprocess) =>
         Effect.callback<void, Error>((resume) => {
-          const timer = setTimeout(() => resume(Effect.succeed(undefined)), 500);
-          subprocess.on("error", (error) => {
+          const complete = () => resume(Effect.succeed(undefined));
+          const fail = (error: Error) => resume(Effect.fail(error));
+          const exit = (code: number | null) => {
+            if (code !== null && code !== 0) fail(new Error(`Browser open failed with exit code ${code}`));
+          };
+          const timer = setTimeout(complete, 500);
+          subprocess.once("error", fail);
+          subprocess.once("exit", exit);
+          return Effect.sync(() => {
             clearTimeout(timer);
-            resume(Effect.fail(error));
-          });
-          subprocess.on("exit", (code) => {
-            if (code !== null && code !== 0) {
-              clearTimeout(timer);
-              resume(Effect.fail(new Error(`Browser open failed with exit code ${code}`)));
-            }
+            subprocess.removeListener("error", fail);
+            subprocess.removeListener("exit", exit);
           });
         }),
-      );
-    } catch {
-      await onAuthorizationUrl?.(url);
-    }
+      ),
+    );
+    const fallback = Effect.tryPromise({
+      try: () => Promise.resolve(onAuthorizationUrl?.(url)),
+      catch: (error) => error,
+    });
+    return launch.pipe(Effect.catch(() => fallback));
   }
 }
 
@@ -1100,19 +1069,11 @@ function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError";
 }
 
-async function safeCloseClient(client: Client, transport: Transport): Promise<void> {
-  return Effect.runPromise(safeCloseClientEffect(client, transport));
-}
-
 function safeCloseClientEffect(client: Client, transport: Transport) {
   return Effect.tryPromise({ try: () => client.close(), catch: (error) => error }).pipe(
     Effect.catch(() => safeCloseTransportEffect(transport)),
     Effect.asVoid,
   );
-}
-
-function safeCloseTransport(transport: Transport): Promise<void> {
-  return Effect.runPromise(safeCloseTransportEffect(transport));
 }
 
 function safeCloseTransportEffect(transport: Transport) {

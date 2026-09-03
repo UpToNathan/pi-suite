@@ -8,9 +8,9 @@ import type { McpConfig, McpStatus } from "./types.js";
 
 /** Runtime operations owned by the Pi extension composition root and used by `/mcp`. */
 export interface McpCommandDependencies {
-  readonly ensureManager: (ctx: ExtensionCommandContext) => Promise<McpManager>;
+  readonly ensureManager: (ctx: ExtensionCommandContext) => Effect.Effect<McpManager, unknown>;
   readonly getConfig: () => McpConfig;
-  readonly reload: (ctx: ExtensionCommandContext) => Promise<void>;
+  readonly reload: (ctx: ExtensionCommandContext) => Effect.Effect<void, unknown>;
   readonly refreshRuntime: (ctx: ExtensionCommandContext) => void;
   readonly showStatus: (text: string) => void;
   readonly showAuthorizationUrl: (url: string) => void;
@@ -24,7 +24,7 @@ export function runMcpCommand(
 ): Promise<void> {
   return Effect.runPromise(
     Effect.gen(function* () {
-      const manager = yield* Effect.tryPromise({ try: () => dependencies.ensureManager(ctx), catch: (error) => error });
+      const manager = yield* dependencies.ensureManager(ctx);
   if (ctx.mode !== "tui") {
     dependencies.showStatus(formatNonInteractiveStatus(manager, dependencies.getConfig()));
     return;
@@ -32,7 +32,7 @@ export function runMcpCommand(
 
   let selectedServerName: string | undefined;
   while (true) {
-    const view = yield* Effect.tryPromise({ try: () => createMcpManagerView(manager, dependencies.getConfig()), catch: (error) => error });
+    const view = yield* createMcpManagerViewEffect(manager, dependencies.getConfig());
     const action = yield* Effect.tryPromise({ try: () => showMcpManagerOverlay(ctx, view, selectedServerName), catch: (error) => error });
     if ("server" in action) selectedServerName = action.server.name;
     try {
@@ -40,43 +40,49 @@ export function runMcpCommand(
         case "close":
           return;
         case "reload":
-          yield* Effect.tryPromise({ try: () => runMcpOperation(ctx, "reloading", () => dependencies.reload(ctx)), catch: (error) => error });
+          yield* runMcpOperationEffect(
+            ctx,
+            "reloading",
+            dependencies.reload(ctx),
+          );
           ctx.ui.notify("Reloaded MCP configuration and reconnected enabled servers", "info");
           continue;
         case "connect": {
-          const status = yield* Effect.tryPromise({
-            try: () => runMcpOperation(ctx, "connecting", () => Effect.runPromise(manager.connectEffect(action.server.name, { intent: "explicit", signal: undefined }))),
-            catch: (error) => error,
-          });
+          const status = yield* runMcpOperationEffect(
+            ctx,
+            "connecting",
+            manager.connectEffect(action.server.name, { intent: "explicit", signal: undefined }),
+          );
           dependencies.refreshRuntime(ctx);
           notifyConnectionStatus(ctx, action.server.name, status);
           continue;
         }
         case "disconnect":
-          yield* Effect.tryPromise({
-            try: () => runMcpOperation(ctx, "disconnecting", () => Effect.runPromise(manager.disconnectEffect(action.server.name))),
-            catch: (error) => error,
-          });
+          yield* runMcpOperationEffect(ctx, "disconnecting", manager.disconnectEffect(action.server.name));
           dependencies.refreshRuntime(ctx);
           ctx.ui.notify(`Disconnected MCP server ${action.server.name}`, "info");
           continue;
         case "authenticate": {
-          const status = yield* Effect.tryPromise({
-            try: () => runMcpOperation(ctx, "authenticating", () => manager.authenticate(action.server.name, async (url) => dependencies.showAuthorizationUrl(url))),
-            catch: (error) => error,
-          });
+          const status = yield* runMcpOperationEffect(
+            ctx,
+            "authenticating",
+            manager.authenticateEffect(action.server.name, (url) => dependencies.showAuthorizationUrl(url)),
+          );
           dependencies.refreshRuntime(ctx);
           notifyConnectionStatus(ctx, action.server.name, status);
           continue;
         }
         case "logout":
-          if (yield* Effect.tryPromise({ try: () => confirmMcpLogout(ctx, action.server.name), catch: (error) => error })) {
-            yield* Effect.tryPromise({ try: () => runMcpOperation(ctx, "logging out", () => manager.removeAuth(action.server.name)), catch: (error) => error });
+          if (yield* Effect.tryPromise({
+            try: () => ctx.ui.confirm("Remove MCP OAuth credentials?", `Log out of ${action.server.name}. You will need to authenticate again.`),
+            catch: (error) => error,
+          })) {
+            yield* runMcpOperationEffect(ctx, "logging out", manager.removeAuthEffect(action.server.name));
             ctx.ui.notify(`Removed OAuth credentials for ${action.server.name}`, "info");
           }
           continue;
         case "prompt": {
-          const sent = yield* Effect.tryPromise({ try: () => runMcpPrompt(ctx, manager, action.server.name, dependencies.sendUserMessage), catch: (error) => error });
+          const sent = yield* runMcpPromptEffect(ctx, manager, action.server.name, dependencies.sendUserMessage);
           if (sent) return;
           continue;
         }
@@ -91,14 +97,13 @@ export function runMcpCommand(
   );
 }
 
-async function createMcpManagerView(manager: McpManager, config: McpConfig): Promise<McpManagerView> {
+function createMcpManagerViewEffect(manager: McpManager, config: McpConfig) {
   const statuses = manager.status();
   const clients = manager.connectedClients();
   const toolCounts = new Map<string, number>();
   for (const tool of manager.getToolEntries()) toolCounts.set(tool.server, (toolCounts.get(tool.server) ?? 0) + 1);
 
-  const servers = await Effect.runPromise(
-    Effect.forEach(
+  return Effect.forEach(
       Object.entries(config.servers).sort(([left], [right]) => left.localeCompare(right)),
       ([name, serverConfig]) =>
         Effect.gen(function* () {
@@ -120,46 +125,31 @@ async function createMcpManagerView(manager: McpManager, config: McpConfig): Pro
           return view;
         }),
       { concurrency: "unbounded" },
-    ),
-  );
-
-  return {
-    configSource: config.source,
-    toolMode: config.toolMode ?? "direct",
-    startupMode: config.startup ?? "lazy",
-    servers,
-  };
+    ).pipe(
+      Effect.map((servers): McpManagerView => ({
+        configSource: config.source,
+        toolMode: config.toolMode ?? "direct",
+        startupMode: config.startup ?? "lazy",
+        servers,
+      })),
+    );
 }
 
-function runMcpOperation<T>(
-  ctx: ExtensionCommandContext,
-  operation: string,
-  execute: () => Promise<T>,
-): Promise<T> {
-  ctx.ui.setStatus("mcp-command", ctx.ui.theme.fg("accent", `mcp:${operation}`));
-  return Effect.runPromise(
-    Effect.tryPromise({ try: execute, catch: (error) => error }).pipe(
-      Effect.ensuring(Effect.sync(() => ctx.ui.setStatus("mcp-command", undefined))),
-    ),
+function runMcpOperationEffect<A, E, R>(ctx: ExtensionCommandContext, operation: string, effect: Effect.Effect<A, E, R>) {
+  return Effect.sync(() => ctx.ui.setStatus("mcp-command", ctx.ui.theme.fg("accent", `mcp:${operation}`))).pipe(
+    Effect.andThen(effect),
+    Effect.ensuring(Effect.sync(() => ctx.ui.setStatus("mcp-command", undefined))),
   );
 }
 
-async function confirmMcpLogout(ctx: ExtensionCommandContext, server: string): Promise<boolean> {
-  return ctx.ui.confirm("Remove MCP OAuth credentials?", `Log out of ${server}. You will need to authenticate again.`);
-}
-
-function runMcpPrompt(
+function runMcpPromptEffect(
   ctx: ExtensionCommandContext,
   manager: McpManager,
   server: string,
   sendUserMessage: (text: string) => void,
-): Promise<boolean> {
-  return Effect.runPromise(
-    Effect.gen(function* () {
-      const result = yield* Effect.tryPromise({
-        try: () => runMcpOperation(ctx, "loading-prompts", () => Effect.runPromise(manager.promptsEffect({ signal: undefined }))),
-        catch: (error) => error,
-      });
+) {
+  return Effect.gen(function* () {
+      const result = yield* runMcpOperationEffect(ctx, "loading-prompts", manager.promptsEffect({ signal: undefined }));
   const prompts = result.prompts.filter((prompt) => prompt.client === server);
   if (prompts.length === 0) {
     ctx.ui.notify(`MCP server ${server} has no prompts`, "warning");
@@ -173,12 +163,13 @@ function runMcpPrompt(
   const selected = prompts[selectedIndex];
   if (selected === undefined) return false;
 
-  const args = yield* Effect.tryPromise({ try: () => collectPromptArguments(ctx, selected), catch: (error) => error });
+  const args = yield* collectPromptArgumentsEffect(ctx, selected);
   if (args === undefined) return false;
-  const prompt = yield* Effect.tryPromise({
-    try: () => runMcpOperation(ctx, "fetching-prompt", () => Effect.runPromise(manager.getPromptEffect(server, selected.name, args, { signal: undefined }))),
-    catch: (error) => error,
-  });
+  const prompt = yield* runMcpOperationEffect(
+    ctx,
+    "fetching-prompt",
+    manager.getPromptEffect(server, selected.name, args, { signal: undefined }),
+  );
   const text = prompt.messages
     ?.map((message) => {
       const content = message.content;
@@ -194,16 +185,11 @@ function runMcpPrompt(
   }
       sendUserMessage(text);
       return true;
-    }),
-  );
+    });
 }
 
-function collectPromptArguments(
-  ctx: ExtensionCommandContext,
-  prompt: Prompt,
-): Promise<Record<string, string> | undefined> {
-  return Effect.runPromise(
-    Effect.gen(function* () {
+function collectPromptArgumentsEffect(ctx: ExtensionCommandContext, prompt: Prompt) {
+  return Effect.gen(function* () {
       const values: Record<string, string> = {};
       for (const argument of prompt.arguments ?? []) {
         const value = yield* Effect.tryPromise({
@@ -223,8 +209,7 @@ function collectPromptArguments(
         }
       }
       return values;
-    }),
-  );
+    });
 }
 
 function formatPromptChoice(prompt: Prompt): string {

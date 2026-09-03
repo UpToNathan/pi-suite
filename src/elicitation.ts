@@ -2,6 +2,7 @@ import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
 import { ElicitResultSchema } from "@modelcontextprotocol/core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import open from "open";
+import { Effect } from "effect";
 
 type PiElicitationContext = {
   readonly hasUI: ExtensionContext["hasUI"];
@@ -12,83 +13,94 @@ type ElicitationContent = NonNullable<ElicitResult["content"]>;
 const CANCEL = Symbol("cancel");
 
 /** Handles MCP elicitation requests using Pi UI primitives or deterministic environment input. */
-export async function handlePiElicitation(
+export function handlePiElicitation(
   server: string,
   request: ElicitRequest,
   ctx: PiElicitationContext | undefined,
 ): Promise<ElicitResult> {
-  const envResponse = responseFromEnv();
-  if (envResponse) return envResponse;
-
-  if (isUrlElicitation(request.params)) return handleUrlElicitation(server, request.params, ctx);
-  if (isFormElicitation(request.params)) return handleFormElicitation(server, request.params, ctx);
-  return { action: "decline" };
+  return Effect.runPromise(handlePiElicitationEffect(server, request, ctx));
 }
 
-async function handleUrlElicitation(
+/** Effect-native MCP elicitation workflow. */
+export function handlePiElicitationEffect(server: string, request: ElicitRequest, ctx: PiElicitationContext | undefined) {
+  return Effect.suspend(() => {
+    const envResponse = responseFromEnv();
+    if (envResponse) return Effect.succeed(envResponse);
+    if (isUrlElicitation(request.params)) return handleUrlElicitationEffect(server, request.params, ctx);
+    if (isFormElicitation(request.params)) return handleFormElicitationEffect(server, request.params, ctx);
+    return Effect.succeed<ElicitResult>({ action: "decline" });
+  });
+}
+
+function handleUrlElicitationEffect(
   server: string,
   params: Extract<ElicitRequest["params"], { mode: "url" }>,
   ctx: PiElicitationContext | undefined,
-): Promise<ElicitResult> {
-  if (!ctx?.hasUI) return { action: "decline" };
-
-  const ok = await ctx.ui.confirm(`MCP ${server} URL request`, `${params.message}\n\n${params.url}`);
-  if (!ok) return { action: "decline" };
-
-  try {
-    await open(params.url);
-    return { action: "accept" };
-  } catch (error) {
-    ctx.ui.notify(`Could not open MCP URL: ${error instanceof Error ? error.message : String(error)}`, "error");
-    return { action: "decline" };
-  }
+) {
+  if (!ctx?.hasUI) return Effect.succeed<ElicitResult>({ action: "decline" });
+  return Effect.tryPromise({
+    try: () => ctx.ui.confirm(`MCP ${server} URL request`, `${params.message}\n\n${params.url}`),
+    catch: (error) => error,
+  }).pipe(
+    Effect.flatMap((ok) => ok
+      ? Effect.tryPromise({ try: () => open(params.url), catch: (error) => error }).pipe(
+          Effect.as<ElicitResult>({ action: "accept" }),
+          Effect.catch((error) => Effect.sync(() => {
+            ctx.ui.notify(`Could not open MCP URL: ${error instanceof Error ? error.message : String(error)}`, "error");
+            return { action: "decline" } satisfies ElicitResult;
+          })),
+        )
+      : Effect.succeed<ElicitResult>({ action: "decline" })),
+  );
 }
 
-async function handleFormElicitation(
+function handleFormElicitationEffect(
   server: string,
   params: Extract<ElicitRequest["params"], { requestedSchema: unknown }>,
   ctx: PiElicitationContext | undefined,
-): Promise<ElicitResult> {
-  if (!ctx?.hasUI) return { action: "decline" };
-
-  const decision = await ctx.ui.select(`MCP Input Request\nServer: ${server}\n\n${params.message}`, ["Continue", "Decline"]);
-  if (decision === "Decline") return { action: "decline" };
-  if (decision !== "Continue") return { action: "cancel" };
-
-  const required = new Set(params.requestedSchema.required ?? []);
-  const content: ElicitationContent = {};
-
-  for (const [name, schema] of Object.entries(params.requestedSchema.properties)) {
-    const value = await askForField(ctx, name, schema, required.has(name));
-    if (value === CANCEL) return { action: "cancel" };
-    if (value !== undefined) content[name] = value;
-  }
-
-  return { action: "accept", content };
+) {
+  if (!ctx?.hasUI) return Effect.succeed<ElicitResult>({ action: "decline" });
+  return Effect.gen(function* () {
+    const decision = yield* Effect.tryPromise({
+      try: () => ctx.ui.select(`MCP Input Request\nServer: ${server}\n\n${params.message}`, ["Continue", "Decline"]),
+      catch: (error) => error,
+    });
+    if (decision === "Decline") return { action: "decline" } satisfies ElicitResult;
+    if (decision !== "Continue") return { action: "cancel" } satisfies ElicitResult;
+    const required = new Set(params.requestedSchema.required ?? []);
+    const content: ElicitationContent = {};
+    for (const [name, schema] of Object.entries(params.requestedSchema.properties)) {
+      const value = yield* askForFieldEffect(ctx, name, schema, required.has(name));
+      if (value === CANCEL) return { action: "cancel" } satisfies ElicitResult;
+      if (value !== undefined) content[name] = value;
+    }
+    return { action: "accept", content } satisfies ElicitResult;
+  });
 }
 
-async function askForField(
+function askForFieldEffect(
   ctx: PiElicitationContext,
   name: string,
   schema: Record<string, unknown>,
   required: boolean,
-): Promise<ElicitationContent[string] | typeof CANCEL | undefined> {
+) {
+  return Effect.gen(function* () {
   const title = fieldTitle(name, schema, required);
   const description = stringProperty(schema, "description") ?? "";
   const defaultValue = schema.default;
 
   const enumValues = stringEnumValues(schema);
   if (enumValues.length > 0) {
-    const selected = await ctx.ui.select(title, enumValues);
+    const selected = yield* Effect.tryPromise({ try: () => ctx.ui.select(title, enumValues), catch: (error) => error });
     return selected ?? (required ? CANCEL : undefined);
   }
 
   if (schema.type === "boolean") {
-    return ctx.ui.confirm(title, description);
+    return yield* Effect.tryPromise({ try: () => ctx.ui.confirm(title, description), catch: (error) => error });
   }
 
   if (schema.type === "number" || schema.type === "integer") {
-    const input = await ctx.ui.input(title, typeof defaultValue === "number" ? String(defaultValue) : description);
+    const input = yield* Effect.tryPromise({ try: () => ctx.ui.input(title, typeof defaultValue === "number" ? String(defaultValue) : description), catch: (error) => error });
     if (input === undefined) return CANCEL;
     if (!input.trim()) {
       if (typeof defaultValue === "number") return defaultValue;
@@ -103,10 +115,10 @@ async function askForField(
   }
 
   if (schema.type === "array") {
-    const input = await ctx.ui.input(
-      title,
-      Array.isArray(defaultValue) ? defaultValue.join(", ") : arrayPlaceholder(schema, description),
-    );
+    const input = yield* Effect.tryPromise({
+      try: () => ctx.ui.input(title, Array.isArray(defaultValue) ? defaultValue.join(", ") : arrayPlaceholder(schema, description)),
+      catch: (error) => error,
+    });
     if (input === undefined) return CANCEL;
     if (!input.trim()) {
       if (Array.isArray(defaultValue) && defaultValue.every((item) => typeof item === "string")) return defaultValue;
@@ -118,11 +130,12 @@ async function askForField(
       .filter((item) => item.length > 0);
   }
 
-  const input = await ctx.ui.input(title, typeof defaultValue === "string" ? defaultValue : description);
+  const input = yield* Effect.tryPromise({ try: () => ctx.ui.input(title, typeof defaultValue === "string" ? defaultValue : description), catch: (error) => error });
   if (input === undefined) return CANCEL;
   if (!input && typeof defaultValue === "string") return defaultValue;
   if (!input && !required) return undefined;
   return input;
+  });
 }
 
 function responseFromEnv(): ElicitResult | undefined {
