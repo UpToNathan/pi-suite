@@ -1,4 +1,5 @@
 import path from "node:path";
+import { Effect } from "effect";
 import { pathToFileURL } from "node:url";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Client, StreamableHTTPClientTransport, SSEClientTransport, UnauthorizedError } from "@modelcontextprotocol/client";
@@ -156,12 +157,19 @@ export class McpManager {
       return this.canExplicitConnect(serverConfig);
     });
 
-    const settled = await Promise.allSettled(
-      targets.map(([name]) =>
-        this.connect(name, {
-          intent: options.intent,
-          signal: options.signal,
-        }),
+    const settled = await Effect.runPromise(
+      Effect.all(
+        targets.map(([name]) =>
+          Effect.tryPromise({
+            try: () =>
+              this.connect(name, {
+                intent: options.intent,
+                signal: options.signal,
+              }),
+            catch: (reason) => reason,
+          }),
+        ),
+        { concurrency: "unbounded", mode: "result" },
       ),
     );
 
@@ -172,15 +180,15 @@ export class McpManager {
       const target = targets[index];
 
       if (!result || !target) continue;
-      if (result.status === "fulfilled") continue;
+      if (result._tag === "Success") continue;
 
-      if (isAbortError(result.reason)) {
-        throw result.reason;
+      if (isAbortError(result.failure)) {
+        throw result.failure;
       }
 
       this.statuses.set(target[0], {
         status: "failed",
-        error: errorMessage(result.reason),
+        error: errorMessage(result.failure),
       });
 
       hasUnhandledFailure = true;
@@ -815,13 +823,24 @@ export class McpManager {
   private async closePendingOAuthTransports(): Promise<void> {
     const transports = Array.from(this.pendingOAuthTransports.values());
     this.pendingOAuthTransports.clear();
-    await Promise.all(transports.map((transport) => safeCloseTransport(transport)));
+    await Effect.runPromise(
+      Effect.forEach(transports, (transport) => Effect.tryPromise({ try: () => safeCloseTransport(transport), catch: () => undefined }), {
+        concurrency: "unbounded",
+        discard: true,
+      }),
+    );
   }
 
   private async closeClients() {
     const clients = Array.from(this.clients.values());
     this.clients.clear();
-    await Promise.all(clients.map((managed) => safeCloseClient(managed.client, managed.transport)));
+    await Effect.runPromise(
+      Effect.forEach(
+        clients,
+        (managed) => Effect.tryPromise({ try: () => safeCloseClient(managed.client, managed.transport), catch: () => undefined }),
+        { concurrency: "unbounded", discard: true },
+      ),
+    );
   }
 
   private async emitStatusChanged() {
@@ -1022,11 +1041,16 @@ async function collectPartial<T>(
   list: (name: string, managed: ManagedClient) => Promise<T[]>,
 ) {
   signal?.throwIfAborted();
-  const settled = await Promise.allSettled(
-    targets.map(async ([name, managed]) => ({
-      name,
-      items: await list(name, managed),
-    })),
+  const settled = await Effect.runPromise(
+    Effect.all(
+      targets.map(([name, managed]) =>
+        Effect.tryPromise({
+          try: async () => ({ name, items: await list(name, managed) }),
+          catch: (reason) => reason,
+        }),
+      ),
+      { concurrency: "unbounded", mode: "result" },
+    ),
   );
   const items: T[] = [];
   const failures: McpServerFailure[] = [];
@@ -1034,12 +1058,12 @@ async function collectPartial<T>(
     const result = settled[index];
     const target = targets[index];
     if (!result || !target) continue;
-    if (result.status === "fulfilled") {
-      items.push(...result.value.items);
+    if (result._tag === "Success") {
+      items.push(...result.success.items);
       continue;
     }
-    if (isAbortError(result.reason)) throw result.reason;
-    failures.push({ server: target[0], error: safeErrorSummary(result.reason) });
+    if (isAbortError(result.failure)) throw result.failure;
+    failures.push({ server: target[0], error: safeErrorSummary(result.failure) });
   }
   return { items, failures };
 }
