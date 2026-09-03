@@ -4,6 +4,7 @@ import { Text } from "@earendil-works/pi-tui";
 import type { Tool } from "@modelcontextprotocol/client";
 import type { TSchema } from "typebox";
 import { Type } from "typebox";
+import { Effect } from "effect";
 import { callMcpTool, formatResourceContent, formatResourceList, toolParameters } from "./catalog.js";
 import { loadMcpConfig } from "./config.js";
 import { formatMcpServerTarget, redactSecrets } from "./display.js";
@@ -82,25 +83,34 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     return { activeManager, generation };
   }
 
-  async function connectConfiguredServers(activeManager: McpManager, generation: number) {
-    await activeManager.connectAll({
-      intent: "automatic",
-      signal: undefined,
+  function connectConfiguredServers(activeManager: McpManager, generation: number) {
+    return Effect.gen(function* () {
+      yield* Effect.tryPromise({
+        try: () => activeManager.connectAll({ intent: "automatic", signal: undefined }),
+        catch: (error) => error,
+      });
+      if (manager !== activeManager || configGeneration !== generation) return;
+      yield* Effect.sync(() => registerDynamicTools());
     });
-    if (manager !== activeManager || configGeneration !== generation) return;
-    registerDynamicTools();
   }
 
   function startBackgroundConnectionRefresh(ctx: ExtensionContext, activeManager: McpManager, generation: number) {
-    backgroundConnectionRefresh = (async () => {
-      await connectConfiguredServers(activeManager, generation);
-      if (manager !== activeManager || configGeneration !== generation) return;
-      updateMcpStatus(ctx);
-    })().catch((error: unknown) => {
-      if (manager !== activeManager || configGeneration !== generation) return;
-      console.error(`[mcp] background connection refresh failed: ${safeErrorSummary(error)}`);
-      updateMcpStatus(ctx);
-    });
+    backgroundConnectionRefresh = Effect.runPromise(
+      connectConfiguredServers(activeManager, generation).pipe(
+        Effect.tap(() =>
+          manager === activeManager && configGeneration === generation
+            ? Effect.sync(() => updateMcpStatus(ctx))
+            : Effect.void,
+        ),
+        Effect.catch((error) => {
+          if (manager !== activeManager || configGeneration !== generation) return Effect.void;
+          return Effect.sync(() => {
+            console.error(`[mcp] background connection refresh failed: ${safeErrorSummary(error)}`);
+            updateMcpStatus(ctx);
+          });
+        }),
+      ),
+    );
   }
 
   function registerDynamicTools() {
