@@ -1,7 +1,7 @@
 import { CallToolResultSchema } from "@modelcontextprotocol/core";
 import { Client } from "@modelcontextprotocol/client";
 import { Effect } from "effect";
-import type { CallToolResult, Prompt, Resource, Tool } from "@modelcontextprotocol/client";
+import type { CallToolResult, Progress, Prompt, PromptMessage, Resource, ResourceTemplateType, Tool } from "@modelcontextprotocol/client";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import {
@@ -96,6 +96,15 @@ export function listResourcesEffect(client: Client, timeout = DEFAULT_TIMEOUT, s
   );
 }
 
+/** Effect-native MCP resource-template listing. */
+export function listResourceTemplatesEffect(client: Client, timeout = DEFAULT_TIMEOUT, signal: AbortSignal | undefined) {
+  if (!client.getServerCapabilities()?.resources) return Effect.succeed<ResourceTemplateType[]>([]);
+  return paginateEffect(
+    (cursor) => client.listResourceTemplates(cursor === undefined ? undefined : { cursor }, requestOptions(timeout, signal)),
+    (result) => result.resourceTemplates,
+  );
+}
+
 /** Returns Pi-compatible parameters for one MCP tool definition. */
 export function toolParameters(tool: Tool) {
   return normalizeToolSchema(tool.inputSchema);
@@ -108,6 +117,7 @@ export function callMcpTool(input: {
   readonly args: Record<string, unknown>;
   readonly timeout?: number;
   readonly signal: AbortSignal | undefined;
+  readonly onProgress?: (progress: Progress) => void;
 }): Promise<AgentToolResult<Record<string, unknown>>> {
   return Effect.runPromise(callMcpToolEffect(input));
 }
@@ -119,6 +129,7 @@ export function callMcpToolEffect(input: {
   readonly args: Record<string, unknown>;
   readonly timeout?: number;
   readonly signal: AbortSignal | undefined;
+  readonly onProgress?: (progress: Progress) => void;
 }) {
   return Effect.gen(function* () {
     const rawResult = yield* Effect.tryPromise({
@@ -129,7 +140,7 @@ export function callMcpToolEffect(input: {
             arguments: input.args,
           },
           {
-            ...requestOptions(input.timeout, input.signal),
+            ...requestOptions(input.timeout, input.signal, input.onProgress),
             toolDefinition: input.tool,
           },
         ),
@@ -153,15 +164,25 @@ export function callMcpToolEffect(input: {
   });
 }
 
+/** Converts MCP prompt messages into Pi user-message content while retaining source roles. */
+export function formatPromptMessages(messages: PromptMessage[]) {
+  return messages.flatMap((message) => {
+    const converted = convertMcpContent([message.content]).content;
+    const prefix = `[MCP prompt ${message.role}]`;
+    const first = converted[0];
+    if (first?.type === "text") return [{ ...first, text: `${prefix}\n${first.text}` }, ...converted.slice(1)];
+    return [{ type: "text" as const, text: prefix }, ...converted];
+  });
+}
+
 /** Projects MCP resource metadata into the JSON shape returned by Pi's resource-list tool. */
 export function formatResourceList(resources: Array<Resource & { client: string }>) {
-  return resources.map((resource) => ({
-    name: resource.name,
-    uri: resource.uri,
-    description: resource.description,
-    mimeType: resource.mimeType,
-    server: resource.client,
-  }));
+  return resources.map(({ client, ...resource }) => ({ ...resource, server: client }));
+}
+
+/** Projects MCP resource-template metadata into the JSON shape returned by Pi's resource-list tool. */
+export function formatResourceTemplateList(templates: Array<ResourceTemplateType & { client: string }>) {
+  return templates.map(({ client, ...template }) => ({ ...template, server: client }));
 }
 
 /** Converts MCP resource contents into text and supported image attachments for Pi. */
@@ -220,6 +241,24 @@ function convertMcpContent(content: CallToolResult["content"]) {
       continue;
     }
 
+    if (item.type === "audio") {
+      omitted.push(`audio (${item.mimeType}, ${formatBytes(base64Size(item.data))})`);
+      continue;
+    }
+
+    if (item.type === "resource_link") {
+      output.push({
+        type: "text",
+        text: [
+          `MCP resource link: ${item.name}`,
+          `URI: ${item.uri}`,
+          item.mimeType ? `MIME: ${item.mimeType}` : undefined,
+          item.description,
+        ].filter((line): line is string => line !== undefined).join("\n"),
+      });
+      continue;
+    }
+
     if (item.type === "resource") {
       const resource = item.resource;
       if ("text" in resource && typeof resource.text === "string") {
@@ -238,11 +277,10 @@ function convertMcpContent(content: CallToolResult["content"]) {
     }
   }
 
-  if (output.length === 0) {
-    output.push({
-      type: "text",
-      text: omitted.length ? `MCP returned only unsupported binary content: ${omitted.join(", ")}` : "MCP tool returned no content.",
-    });
+  if (omitted.length > 0) {
+    output.push({ type: "text", text: `MCP omitted unsupported binary content: ${omitted.join(", ")}` });
+  } else if (output.length === 0) {
+    output.push({ type: "text", text: "MCP returned no content." });
   }
 
   return { content: output, omitted };
@@ -266,11 +304,11 @@ function normalizeCallToolResult(value: Awaited<ReturnType<Client["callTool"]>>)
   return { content: [{ type: "text", text: "MCP tool returned no content." }] };
 }
 
-function requestOptions(timeout: number | undefined, signal: CancellableOptions["signal"]) {
+function requestOptions(timeout: number | undefined, signal: CancellableOptions["signal"], onProgress?: (progress: Progress) => void) {
   return {
     resetTimeoutOnProgress: true,
     timeout: timeout ?? DEFAULT_TIMEOUT,
-    onprogress: () => {},
+    onprogress: onProgress ?? (() => {}),
     ...(signal ? { signal } : {}),
   };
 }

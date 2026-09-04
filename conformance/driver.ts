@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
+import { Effect } from "effect";
 import { AuthStore } from "../src/auth-store.js";
-import { callMcpTool } from "../src/catalog.js";
 import { McpManager } from "../src/manager.js";
 import type { McpConfig, OAuthConfig } from "../src/types.js";
 import { findFreePort } from "../test/helpers.js";
@@ -14,8 +14,19 @@ const context = parseScenarioContext(process.env.MCP_CONFORMANCE_CONTEXT);
 const callbackPort = await findFreePort();
 const oauth: OAuthConfig = {
   callbackPort,
+  ...(scenario === "auth/basic-cimd" ? { clientMetadataUrl: "https://conformance-test.local/client-metadata.json" } : {}),
+  ...(scenario === "auth/client-credentials-basic" ? { grantType: "client_credentials" } : {}),
+  ...(scenario === "auth/client-credentials-jwt" ? { grantType: "private_key_jwt" } : {}),
+  ...(scenario === "auth/cross-app-access-complete-flow" ? { grantType: "cross_app" } : {}),
+  ...(scenario === "auth/2025-03-26-oauth-metadata-backcompat" ? { skipIssuerMetadataValidation: true } : {}),
   ...(context.clientId ? { clientId: context.clientId } : {}),
   ...(context.clientSecret ? { clientSecret: context.clientSecret } : {}),
+  ...(context.privateKey ? { privateKey: context.privateKey } : {}),
+  ...(context.algorithm ? { algorithm: context.algorithm } : {}),
+  ...(context.idpUrl ? { idpUrl: context.idpUrl } : {}),
+  ...(context.idpTokenEndpoint ? { idpTokenEndpoint: context.idpTokenEndpoint } : {}),
+  ...(context.idpToken ? { idpToken: context.idpToken } : {}),
+  ...(context.idpClientId ? { idpClientId: context.idpClientId } : {}),
 };
 const manager = new McpManager({
   cwd: process.cwd(),
@@ -69,12 +80,18 @@ try {
 async function callConformanceTool(name: string, args: Record<string, unknown>): Promise<void> {
   const entry = manager.getToolEntries().find((tool) => tool.name === name);
   if (!entry) throw new Error(`Conformance tool was not listed: ${name}`);
-  await callMcpTool({ client: entry.client, tool: entry.tool, args, timeout: 60_000, signal: undefined });
+  await Effect.runPromise(manager.callToolEffect(entry, args, { signal: undefined }));
 }
 
 type ScenarioContext = {
   readonly clientId?: string;
   readonly clientSecret?: string;
+  readonly privateKey?: string;
+  readonly algorithm?: string;
+  readonly idpUrl?: string;
+  readonly idpTokenEndpoint?: string;
+  readonly idpToken?: string;
+  readonly idpClientId?: string;
 };
 
 function parseScenarioContext(raw: string | undefined): ScenarioContext {
@@ -88,8 +105,24 @@ function parseScenarioContext(raw: string | undefined): ScenarioContext {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   const clientId = Reflect.get(value, "client_id");
   const clientSecret = Reflect.get(value, "client_secret");
+  const strings = (key: string) => {
+    const item = Reflect.get(value, key);
+    return typeof item === "string" ? item : undefined;
+  };
+  const privateKey = strings("private_key_pem");
+  const algorithm = strings("signing_algorithm");
+  const idpUrl = strings("idp_issuer");
+  const idpTokenEndpoint = strings("idp_token_endpoint");
+  const idpToken = strings("idp_id_token");
+  const idpClientId = strings("idp_client_id");
   return {
     ...(typeof clientId === "string" ? { clientId } : {}),
     ...(typeof clientSecret === "string" ? { clientSecret } : {}),
+    ...(privateKey ? { privateKey } : {}),
+    ...(algorithm ? { algorithm } : {}),
+    ...(idpUrl ? { idpUrl } : {}),
+    ...(idpTokenEndpoint ? { idpTokenEndpoint } : {}),
+    ...(idpToken ? { idpToken } : {}),
+    ...(idpClientId ? { idpClientId } : {}),
   };
 }

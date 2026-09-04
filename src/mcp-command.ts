@@ -1,6 +1,8 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { Effect } from "effect";
 import type { Prompt } from "@modelcontextprotocol/client";
+import { formatPromptMessages } from "./catalog.js";
 import { formatMcpServerTarget } from "./display.js";
 import type { McpManager } from "./manager.js";
 import { showMcpManagerOverlay, type McpManagerView, type McpServerView } from "./mcp-manager-overlay.js";
@@ -14,7 +16,7 @@ export interface McpCommandDependencies {
   readonly refreshRuntime: (ctx: ExtensionCommandContext) => void;
   readonly showStatus: (text: string) => void;
   readonly showAuthorizationUrl: (url: string) => void;
-  readonly sendUserMessage: (text: string) => void;
+  readonly sendUserMessage: (content: string | Array<TextContent | ImageContent>) => void;
 }
 
 /** Run the interactive MCP server manager from the single `/mcp` command. */
@@ -108,10 +110,9 @@ function createMcpManagerViewEffect(manager: McpManager, config: McpConfig) {
       ([name, serverConfig]) =>
         Effect.gen(function* () {
           const client = clients.get(name);
-          const authStatus =
-            serverConfig.type === "remote" && serverConfig.oauth !== false
-              ? yield* manager.authStatusEffect(name)
-              : undefined;
+          const interactiveOAuth = serverConfig.type === "remote" && serverConfig.oauth !== false &&
+            (typeof serverConfig.oauth !== "object" || !serverConfig.oauth.grantType || serverConfig.oauth.grantType === "authorization_code");
+          const authStatus = interactiveOAuth ? yield* manager.authStatusEffect(name) : undefined;
           const view: McpServerView = {
             name,
             type: serverConfig.type,
@@ -146,7 +147,7 @@ function runMcpPromptEffect(
   ctx: ExtensionCommandContext,
   manager: McpManager,
   server: string,
-  sendUserMessage: (text: string) => void,
+  sendUserMessage: (content: string | Array<TextContent | ImageContent>) => void,
 ) {
   return Effect.gen(function* () {
       const result = yield* runMcpOperationEffect(ctx, "loading-prompts", manager.promptsEffect({ signal: undefined }));
@@ -163,43 +164,51 @@ function runMcpPromptEffect(
   const selected = prompts[selectedIndex];
   if (selected === undefined) return false;
 
-  const args = yield* collectPromptArgumentsEffect(ctx, selected);
+  const args = yield* collectPromptArgumentsEffect(ctx, manager, server, selected);
   if (args === undefined) return false;
   const prompt = yield* runMcpOperationEffect(
     ctx,
     "fetching-prompt",
     manager.getPromptEffect(server, selected.name, args, { signal: undefined }),
   );
-  const text = prompt.messages
-    ?.map((message) => {
-      const content = message.content;
-      return typeof content === "object" && content !== null && "type" in content && content.type === "text"
-        ? content.text
-        : "";
-    })
-    .filter((content) => content.length > 0)
-    .join("\n") ?? "";
-  if (!text.trim()) {
-    ctx.ui.notify("MCP prompt returned no text content", "warning");
+  const content = formatPromptMessages(prompt.messages ?? []);
+  if (content.length === 0) {
+    ctx.ui.notify("MCP prompt returned no content", "warning");
     return false;
   }
-      sendUserMessage(text);
+      sendUserMessage(content);
       return true;
     });
 }
 
-function collectPromptArgumentsEffect(ctx: ExtensionCommandContext, prompt: Prompt) {
+function collectPromptArgumentsEffect(ctx: ExtensionCommandContext, manager: McpManager, server: string, prompt: Prompt) {
   return Effect.gen(function* () {
       const values: Record<string, string> = {};
       for (const argument of prompt.arguments ?? []) {
-        const value = yield* Effect.tryPromise({
-          try: () =>
-            ctx.ui.input(
-              `${prompt.name} — ${argument.name}${argument.required ? " (required)" : ""}`,
-              argument.description ?? (argument.required ? "required" : "optional; leave blank to omit"),
-            ),
-          catch: (error) => error,
-        });
+        const suggestions = manager.connectedClients().get(server)?.hasCompletions
+          ? yield* manager.completeEffect(server, {
+              ref: { type: "ref/prompt", name: prompt.name },
+              argument: { name: argument.name, value: "" },
+              context: { arguments: values },
+            }, { signal: undefined }).pipe(
+              Effect.map((result) => result.completion.values),
+              Effect.catch(() => Effect.succeed<string[]>([])),
+            )
+          : [];
+        const manual = "Enter another value…";
+        const selected = suggestions.length > 0
+          ? yield* Effect.tryPromise({ try: () => ctx.ui.select(`${prompt.name} — ${argument.name}`, [...suggestions, manual]), catch: (error) => error })
+          : manual;
+        if (selected === undefined) return undefined;
+        const value = selected === manual
+          ? yield* Effect.tryPromise({
+              try: () => ctx.ui.input(
+                `${prompt.name} — ${argument.name}${argument.required ? " (required)" : ""}`,
+                argument.description ?? (argument.required ? "required" : "optional; leave blank to omit"),
+              ),
+              catch: (error) => error,
+            })
+          : selected;
         if (value === undefined) return undefined;
         const trimmed = value.trim();
         if (trimmed.length > 0) values[argument.name] = trimmed;

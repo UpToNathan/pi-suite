@@ -156,13 +156,34 @@ function parseServer(value: unknown, defaultTimeout: number | undefined, pathLab
   if (!isPlainRecord(value)) {
     throw new Error(`Invalid MCP config in ${source}: ${pathLabel} must be an object`);
   }
-  if (value.type !== "local" && value.type !== "remote") {
-    throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.type must be "local" or "remote"`);
+  if (value.type !== "local" && value.type !== "remote" && value.type !== "webmcp") {
+    throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.type must be "local", "remote", or "webmcp"`);
   }
 
   const timeout = parseOptionalPositiveInt(value.timeout, `${pathLabel}.timeout`, source) ?? defaultTimeout;
   const enabled = typeof value.enabled === "boolean" ? value.enabled : undefined;
   const disabled = typeof value.disabled === "boolean" ? value.disabled : undefined;
+
+  if (value.type === "webmcp") {
+    if (!Array.isArray(value.allowedOrigins) || value.allowedOrigins.length === 0 || !value.allowedOrigins.every((origin) => typeof origin === "string" && URL.canParse(origin))) {
+      throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.allowedOrigins must be a non-empty array of absolute origins`);
+    }
+    const port = parseOptionalPositiveInt(value.port, `${pathLabel}.port`, source);
+    return {
+      type: "local",
+      command: [
+        "npx",
+        "--yes",
+        "@mcp-b/webmcp-local-relay@5.1.0",
+        "--widget-origin",
+        value.allowedOrigins.join(","),
+        ...(port ? ["--port", String(port)] : []),
+      ],
+      ...(enabled !== undefined ? { enabled } : {}),
+      ...(disabled !== undefined ? { disabled } : {}),
+      ...(timeout !== undefined ? { timeout } : {}),
+    };
+  }
 
   if (value.type === "local") {
     const command = parseCommand(value.command, `${pathLabel}.command`, source);
@@ -233,12 +254,44 @@ function parseOAuth(value: unknown, pathLabel: string, source: string): OAuthCon
   const redirectUri =
     stringAt(value, "redirectUri", `${pathLabel}.redirectUri`, source) ??
     stringAt(value, "redirect_uri", `${pathLabel}.redirect_uri`, source);
+  const grantType = stringAt(value, "grantType", `${pathLabel}.grantType`, source) ?? stringAt(value, "grant_type", `${pathLabel}.grant_type`, source);
+  if (grantType !== undefined && !["authorization_code", "client_credentials", "private_key_jwt", "cross_app"].includes(grantType)) {
+    throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.grantType is not supported`);
+  }
+  const optional = (camel: string, snake: string) =>
+    stringAt(value, camel, `${pathLabel}.${camel}`, source) ?? stringAt(value, snake, `${pathLabel}.${snake}`, source);
+  const clientMetadataUrl = optional("clientMetadataUrl", "client_metadata_url");
+  const expectedIssuer = optional("expectedIssuer", "expected_issuer");
+  const privateKey = optional("privateKey", "private_key");
+  const algorithm = optional("algorithm", "signing_algorithm");
+  const jwtBearerAssertion = optional("jwtBearerAssertion", "jwt_bearer_assertion");
+  const idpUrl = optional("idpUrl", "idp_url");
+  const idpTokenEndpoint = optional("idpTokenEndpoint", "idp_token_endpoint");
+  const idpToken = optional("idpToken", "idp_token");
+  const idpClientId = optional("idpClientId", "idp_client_id");
+  const idpClientSecret = optional("idpClientSecret", "idp_client_secret");
+  const skipIssuerMetadataValidation = value.skipIssuerMetadataValidation ?? value.skip_issuer_metadata_validation;
+  if (skipIssuerMetadataValidation !== undefined && typeof skipIssuerMetadataValidation !== "boolean") {
+    throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.skipIssuerMetadataValidation must be a boolean`);
+  }
   return {
+    ...(grantType !== undefined ? { grantType: grantType as NonNullable<OAuthConfig["grantType"]> } : {}),
     ...(clientId !== undefined ? { clientId } : {}),
     ...(clientSecret !== undefined ? { clientSecret } : {}),
     ...(scope !== undefined ? { scope } : {}),
     ...(callbackPort !== undefined ? { callbackPort } : {}),
     ...(redirectUri !== undefined ? { redirectUri } : {}),
+    ...(clientMetadataUrl !== undefined ? { clientMetadataUrl } : {}),
+    ...(expectedIssuer !== undefined ? { expectedIssuer } : {}),
+    ...(privateKey !== undefined ? { privateKey } : {}),
+    ...(algorithm !== undefined ? { algorithm } : {}),
+    ...(jwtBearerAssertion !== undefined ? { jwtBearerAssertion } : {}),
+    ...(idpUrl !== undefined ? { idpUrl } : {}),
+    ...(idpTokenEndpoint !== undefined ? { idpTokenEndpoint } : {}),
+    ...(idpToken !== undefined ? { idpToken } : {}),
+    ...(idpClientId !== undefined ? { idpClientId } : {}),
+    ...(idpClientSecret !== undefined ? { idpClientSecret } : {}),
+    ...(skipIssuerMetadataValidation !== undefined ? { skipIssuerMetadataValidation } : {}),
   };
 }
 

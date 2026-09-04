@@ -4,20 +4,20 @@ Effect-native Pi suite, starting with OpenCode-style MCP client support.
 
 ## Requirements
 
-Pi-MCP requires Node.js 20 or newer. It negotiates the stateless MCP 2026-07-28 protocol when available and automatically falls back to compatible 2025-era servers.
+Pi Suite requires Node.js 20 or newer. It negotiates the stateless MCP 2026-07-28 protocol when available and automatically falls back to compatible 2025-era servers.
 
 ## Install
 
 From GitHub:
 
 ```bash
-pi install git:github.com/UpToNathan/pi-mcp
+pi install git:github.com/UpToNathan/pi-suite
 ```
 
 For a temporary run:
 
 ```bash
-pi -e /Users/dmmulroy/Documents/pi-mcp
+pi -e /Users/dmmulroy/Documents/pi-suite
 ```
 
 ## Configuration
@@ -81,7 +81,35 @@ In proxy tool mode, the `mcp` gateway registers immediately. With
 `"eager"` starts connecting enabled servers in the background after Pi startup.
 Eager connects run in parallel and do not block Pi's `session_start` handler.
 
-`${ENV_VAR}` placeholders in `environment`, `headers`, `url`, and `cwd` are expanded from the process environment.
+`${ENV_VAR}` placeholders in `environment`, `headers`, `url`, `cwd`, and OAuth string settings are expanded from the process environment.
+
+### WebMCP
+
+A `webmcp` server starts the pinned MCP-B loopback relay. `allowedOrigins` is required so arbitrary open pages cannot register tools:
+
+```jsonc
+{
+  "mcp": {
+    "browser": {
+      "type": "webmcp",
+      "allowedOrigins": ["https://app.example.com"],
+      "port": 9333
+    }
+  }
+}
+```
+
+The website must load the relay embed after registering its WebMCP tools:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/@mcp-b/webmcp-local-relay@5.1.0/dist/browser/embed.js"></script>
+```
+
+The relay supports native `document.modelContext`, `@mcp-b/global`, and the WebMCP polyfill. Pi receives live browser tools through ordinary MCP discovery, including tool-list changes.
+
+### OAuth grant types
+
+`oauth.grantType` supports `authorization_code` (default), `client_credentials`, `private_key_jwt`, and `cross_app`. Client Metadata Document URLs, issuer compatibility, private keys, static JWT assertions, and IdP token-exchange settings are available through the corresponding camelCase OAuth fields documented by `OAuthConfig` in `src/types.ts`.
 
 ## Command
 
@@ -130,10 +158,13 @@ mcp({ search: "screenshot" })              // search tools
 mcp({ describe: "playwright_take_screenshot" })
 mcp({ tool: "playwright_take_screenshot", args: '{"fullPage":true}' })
 mcp({ action: "resources", server: "docs" })
+mcp({ action: "complete-resource", server: "docs", uri: "docs://{topic}", argument: "topic", value: "auth" })
 mcp({ action: "read-resource", server: "docs", uri: "file://..." })
 ```
 
-The extension also registers `list_mcp_resources` and `read_mcp_resource` in direct mode when any connected server supports MCP resources. In proxy mode, resources are available through the `mcp` gateway actions instead.
+The extension also registers `list_mcp_resources`, `complete_mcp_resource`, and `read_mcp_resource` in direct mode when connected servers support the corresponding MCP capabilities. Resource listings include both concrete resources and URI templates. In proxy mode, these are available through the `mcp` gateway actions instead.
+
+MCP prompt argument completions are shown as choices in `/mcp` when the server advertises completion support. Prompt text, images, embedded resources, and resource links are forwarded to Pi; unsupported audio is reported explicitly.
 
 ## Elicitation
 

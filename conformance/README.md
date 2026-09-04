@@ -21,4 +21,4 @@ bash conformance/run.sh --scenario auth/metadata-default --verbose
 
 Each process uses an isolated auth file and dynamically allocated callback port. Results are written to `conformance/results/` unless `CONFORMANCE_RESULTS_DIR` is set. `CONFORMANCE_TIMEOUT_MS` changes the default 90-second timeout.
 
-`baseline-client.yml` records only reviewed product or protocol gaps. Unexpected failures and stale entries fail the command. Current gaps are Client ID Metadata Documents, scope-step-up resumption, strict issuer handling for intentionally mismatched legacy metadata, client-credentials/private-key JWT grants, and cross-app token exchange.
+`baseline-client.yml` records only reviewed environmental gaps. Unexpected failures and stale entries fail the command. The sole baseline entry is the SSE retry timing scenario: reconnection and `Last-Event-ID` behavior pass, but heavily parallel CI runs can exceed the referee's advisory timing window.

@@ -3,7 +3,7 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
-import { createMcpHandler, inputRequired, inputResponse, McpServer } from "@modelcontextprotocol/server";
+import { completable, createMcpHandler, inputRequired, inputResponse, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 
 const ONE_BY_ONE_PNG =
@@ -18,6 +18,7 @@ function createFixtureServer() {
     {
       capabilities: {
         logging: {},
+        resources: { subscribe: true },
       },
     },
   );
@@ -36,6 +37,25 @@ function createFixtureServer() {
       return {
         content: [{ type: "text", text: `echo:${message}` }],
       };
+    },
+  );
+
+  server.registerTool(
+    "progress",
+    {
+      title: "Progress",
+      description: "Emit one progress update before completing.",
+      inputSchema: z.object({}),
+    },
+    async (_args, ctx) => {
+      const progressToken = ctx.mcpReq._meta?.progressToken;
+      if (progressToken !== undefined) {
+        await ctx.mcpReq.notify({
+          method: "notifications/progress",
+          params: { progressToken, progress: 1, total: 2, message: "halfway" },
+        });
+      }
+      return { content: [{ type: "text", text: "progress complete" }] };
     },
   );
 
@@ -72,6 +92,36 @@ function createFixtureServer() {
     },
     async () => ({
       content: [{ type: "image", mimeType: "image/png", data: ONE_BY_ONE_PNG }],
+    }),
+  );
+
+  server.registerTool(
+    "audio",
+    {
+      title: "Audio",
+      description: "Return audio unsupported by Pi's tool-result content model.",
+      inputSchema: z.object({}),
+    },
+    async () => ({
+      content: [{ type: "audio", mimeType: "audio/wav", data: "UklGRg==" }],
+    }),
+  );
+
+  server.registerTool(
+    "resource_link",
+    {
+      title: "Resource Link",
+      description: "Return a link to an MCP resource.",
+      inputSchema: z.object({}),
+    },
+    async () => ({
+      content: [{
+        type: "resource_link",
+        name: "Linked text resource",
+        uri: "test://text",
+        description: "Fixture resource link",
+        mimeType: "text/plain",
+      }],
     }),
   );
 
@@ -206,6 +256,35 @@ function createFixtureServer() {
     },
   );
 
+  server.registerTool(
+    "notify_resource_updated",
+    {
+      title: "Notify Resource Updated",
+      description: "Send a resources/updated notification.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      await server.server.sendResourceUpdated({ uri: "test://text" });
+      return { content: [{ type: "text", text: "sent resources/updated" }] };
+    },
+  );
+
+  server.registerTool(
+    "notify_catalog_changed",
+    {
+      title: "Notify Catalog Changed",
+      description: "Send prompt and resource list_changed notifications.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      await server.sendPromptListChanged();
+      await server.sendResourceListChanged();
+      return {
+        content: [{ type: "text", text: "sent prompt and resource list_changed" }],
+      };
+    },
+  );
+
   server.registerResource(
     "text-resource",
     "test://text",
@@ -232,13 +311,32 @@ function createFixtureServer() {
     }),
   );
 
+  server.registerResource(
+    "city-resource",
+    new ResourceTemplate("test://cities/{city}", {
+      list: undefined,
+      complete: { city: (value) => ["london", "lisbon"].filter((city) => city.startsWith(value)) },
+    }),
+    {
+      title: "City Resource",
+      description: "Fixture city resource template",
+      mimeType: "text/plain",
+    },
+    async (uri, { city }) => ({
+      contents: [{ uri: uri.href, mimeType: "text/plain", text: `fixture city ${city}` }],
+    }),
+  );
+
   server.registerPrompt(
     "review",
     {
       title: "Review Prompt",
       description: "Create a review prompt for a topic.",
       argsSchema: z.object({
-              topic: z.string().describe("Topic to review"),
+              topic: completable(
+                z.string().describe("Topic to review"),
+                (value) => ["MCP", "WebMCP"].filter((topic) => topic.toLowerCase().startsWith(value.toLowerCase())),
+              ),
             }),
     },
     ({ topic }) => ({
@@ -247,6 +345,23 @@ function createFixtureServer() {
           role: "user",
           content: { type: "text", text: `Review ${topic} from the fixture prompt.` },
         },
+      ],
+    }),
+  );
+
+  server.registerPrompt(
+    "multimodal",
+    {
+      title: "Multimodal Prompt",
+      description: "Return every current MCP prompt content type.",
+      argsSchema: z.object({}),
+    },
+    () => ({
+      messages: [
+        { role: "user", content: { type: "image", mimeType: "image/png", data: ONE_BY_ONE_PNG } },
+        { role: "assistant", content: { type: "resource_link", name: "Linked text resource", uri: "test://text" } },
+        { role: "user", content: { type: "resource", resource: { uri: "test://text", mimeType: "text/plain", text: "embedded prompt resource" } } },
+        { role: "assistant", content: { type: "audio", mimeType: "audio/wav", data: "UklGRg==" } },
       ],
     }),
   );

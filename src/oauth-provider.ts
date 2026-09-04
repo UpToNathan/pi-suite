@@ -41,6 +41,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     private auth: AuthStore,
   ) {
     this.writeFence = auth.createOAuthWriteFence(mcpName);
+    if (config?.clientMetadataUrl) Object.assign(this, { clientMetadataUrl: config.clientMetadataUrl });
   }
 
   /** Redirect URI registered with the OAuth authorization server. */

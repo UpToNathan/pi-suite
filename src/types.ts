@@ -10,11 +10,23 @@ export type McpStatus =
 
 /** Optional OAuth settings supplied by an MCP server configuration. */
 export interface OAuthConfig {
+  readonly grantType?: "authorization_code" | "client_credentials" | "private_key_jwt" | "cross_app";
   readonly clientId?: string;
   readonly clientSecret?: string;
   readonly scope?: string;
   readonly callbackPort?: number;
   readonly redirectUri?: string;
+  readonly clientMetadataUrl?: string;
+  readonly expectedIssuer?: string;
+  readonly privateKey?: string;
+  readonly algorithm?: string;
+  readonly jwtBearerAssertion?: string;
+  readonly idpUrl?: string;
+  readonly idpTokenEndpoint?: string;
+  readonly idpToken?: string;
+  readonly idpClientId?: string;
+  readonly idpClientSecret?: string;
+  readonly skipIssuerMetadataValidation?: boolean;
 }
 
 /** Configuration for an MCP server launched as a local subprocess over stdio. */

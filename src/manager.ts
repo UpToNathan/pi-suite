@@ -2,8 +2,19 @@ import path from "node:path";
 import { Effect, Fiber } from "effect";
 import { pathToFileURL } from "node:url";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { Client, StreamableHTTPClientTransport, SSEClientTransport, UnauthorizedError } from "@modelcontextprotocol/client";
-import type { ClientOptions, ElicitRequest, ElicitResult, LoggingMessageNotification, Prompt, Resource, Tool } from "@modelcontextprotocol/client";
+import {
+  Client,
+  ClientCredentialsProvider,
+  CrossAppAccessProvider,
+  PrivateKeyJwtProvider,
+  StaticPrivateKeyJwtProvider,
+  StreamableHTTPClientTransport,
+  SSEClientTransport,
+  UnauthorizedError,
+  discoverAndRequestJwtAuthGrant,
+  requestJwtAuthorizationGrant,
+} from "@modelcontextprotocol/client";
+import type { ClientOptions, CompleteRequestParams, ElicitRequest, ElicitResult, LoggingMessageNotification, McpSubscription, OAuthClientProvider, Prompt, Resource, ResourceTemplateType, ResourceUpdatedNotification, Tool } from "@modelcontextprotocol/client";
 import open from "open";
 import type {
   AuthStatus,
@@ -23,8 +34,8 @@ import { randomHex } from "./random.js";
 import { DEFAULT_TIMEOUT } from "./request-limits.js";
 import { mcpToolKey, sanitizeName } from "./tool-names.js";
 import { withTimeoutEffect } from "./timeout.js";
-import { listPromptsEffect, listResourcesEffect, listToolsEffect } from "./catalog.js";
-import { McpOAuthProvider } from "./oauth-provider.js";
+import { callMcpToolEffect, listPromptsEffect, listResourceTemplatesEffect, listResourcesEffect, listToolsEffect } from "./catalog.js";
+import { McpOAuthProvider, OAUTH_CALLBACK_PATH } from "./oauth-provider.js";
 import { McpManagerError, OAuthError } from "./errors.js";
 import {
   NodeOAuthCallbackRuntime,
@@ -62,6 +73,7 @@ interface ConnectionResult {
 /** Connected MCP client snapshot exposed for extension integration and tests. */
 export interface ConnectedMcpClient {
   readonly client: Client;
+  readonly hasCompletions: boolean;
   readonly hasPrompts: boolean;
   readonly hasResources: boolean;
   readonly hasTools: boolean;
@@ -80,6 +92,7 @@ export interface McpToolEntry {
 /** Result of listing resources across one or more MCP servers. */
 export interface McpResourcesResult {
   readonly resources: Array<Resource & { readonly client: string }>;
+  readonly templates: Array<ResourceTemplateType & { readonly client: string }>;
   readonly failures: readonly McpServerFailure[];
 }
 
@@ -98,6 +111,8 @@ export interface McpServerFailure {
 interface ManagerOptions {
   cwd: string;
   authStore?: AuthStore;
+  onCatalogChanged?: (server: string, kind: "prompts" | "resources") => void | Promise<void>;
+  onResourceUpdated?: (server: string, uri: string) => void | Promise<void>;
   onElicitation?: (server: string, request: ElicitRequest) => ElicitResult | Promise<ElicitResult>;
   onToolsChanged?: (server: string) => void | Promise<void>;
   onStatusChanged?: () => void | Promise<void>;
@@ -116,6 +131,7 @@ export class McpManager {
   private pendingOAuthTransports = new Map<string, TransportWithAuth>();
   private manuallyDisconnected = new Set<string>();
   private connectionAttempts = new Map<string, Fiber.Fiber<McpStatus, unknown>>();
+  private resourceSubscriptions = new Map<string, { client: Client; subscription?: McpSubscription; uri: string }>();
   private closed = false;
   private revision = 0;
 
@@ -210,6 +226,7 @@ export class McpManager {
         name,
         {
           client: managed.client,
+          hasCompletions: !!managed.client.getServerCapabilities()?.completions,
           hasPrompts: !!managed.client.getServerCapabilities()?.prompts,
           hasResources: !!managed.client.getServerCapabilities()?.resources,
           hasTools: !!managed.client.getServerCapabilities()?.tools,
@@ -240,6 +257,26 @@ export class McpManager {
   /** Finds a connected MCP tool by its Pi tool key. */
   getToolEntry(key: string) {
     return this.getToolEntries().find((entry) => entry.key === key);
+  }
+
+  /** Calls a connected tool and retries once after a completed OAuth scope step-up. */
+  callToolEffect(entry: McpToolEntry, args: Record<string, unknown>, options: CancellableOptions & {
+    readonly onProgress?: ((progress: { progress: number; total?: number | undefined; message?: string | undefined }) => void) | undefined;
+  }) {
+    const call = () => callMcpToolEffect({
+      client: entry.client,
+      tool: entry.tool,
+      args,
+      timeout: entry.timeout,
+      signal: options.signal,
+      ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+    });
+    return call().pipe(
+      Effect.catchIf(
+        (error) => error instanceof UnauthorizedError && this.statuses.get(entry.server)?.status === "connected",
+        call,
+      ),
+    );
   }
 
   /** Connects or reconnects one configured MCP server. */
@@ -312,16 +349,100 @@ export class McpManager {
     });
     if (server) {
       const managed = targets[0]?.[1];
-      if (!managed) return Effect.succeed<McpResourcesResult>({ resources: [], failures: [] });
-      return listResourcesEffect(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal).pipe(
-        Effect.map((resources): McpResourcesResult => ({ resources: resources.map((resource) => ({ ...resource, client: server })), failures: [] })),
+      if (!managed) return Effect.succeed<McpResourcesResult>({ resources: [], templates: [], failures: [] });
+      const timeout = managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT;
+      return Effect.all([
+        listResourcesEffect(managed.client, timeout, options.signal),
+        listResourceTemplatesEffect(managed.client, timeout, options.signal),
+      ]).pipe(
+        Effect.map(([resources, templates]): McpResourcesResult => ({
+          resources: resources.map((resource) => ({ ...resource, client: server })),
+          templates: templates.map((template) => ({ ...template, client: server })),
+          failures: [],
+        })),
       );
     }
-    return collectPartialEffect(targets, options.signal, (name, managed) =>
-      listResourcesEffect(managed.client, managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal).pipe(
-        Effect.map((resources) => resources.map((resource) => ({ ...resource, client: name }))),
+    return collectPartialEffect(targets, options.signal, (name, managed) => {
+      const timeout = managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT;
+      return Effect.all([
+        listResourcesEffect(managed.client, timeout, options.signal),
+        listResourceTemplatesEffect(managed.client, timeout, options.signal),
+      ]).pipe(Effect.map(([resources, templates]) => [{ resources, templates, client: name }]));
+    }).pipe(Effect.map((collected): McpResourcesResult => ({
+      resources: collected.items.flatMap(({ resources, client }) => resources.map((resource) => ({ ...resource, client }))),
+      templates: collected.items.flatMap(({ templates, client }) => templates.map((template) => ({ ...template, client }))),
+      failures: collected.failures,
+    })));
+  }
+
+  /** Requests completion candidates for a prompt argument or resource-template variable. */
+  complete(clientName: string, params: CompleteRequestParams, options: CancellableOptions) {
+    return Effect.runPromise(this.completeEffect(clientName, params, options));
+  }
+
+  /** Effect-native MCP completion request. */
+  completeEffect(clientName: string, params: CompleteRequestParams, options: CancellableOptions) {
+    const managed = this.clients.get(clientName);
+    if (!managed) return Effect.fail(new McpManagerError({ message: `MCP server "${clientName}" is not connected` }));
+    if (!managed.client.getServerCapabilities()?.completions) return Effect.fail(new McpManagerError({ message: `MCP server "${clientName}" does not support completions` }));
+    return Effect.tryPromise({
+      try: () => managed.client.complete(
+        params,
+        sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal),
       ),
-    ).pipe(Effect.map((collected): McpResourcesResult => ({ resources: collected.items, failures: collected.failures })));
+      catch: (error) => error,
+    });
+  }
+
+  /** Subscribes to updates for one resource using the negotiated protocol era. */
+  subscribeResource(clientName: string, uri: string, options: CancellableOptions) {
+    return Effect.runPromise(this.subscribeResourceEffect(clientName, uri, options));
+  }
+
+  /** Effect-native resource subscription. */
+  subscribeResourceEffect(clientName: string, uri: string, options: CancellableOptions) {
+    const self = this;
+    return Effect.gen(function* () {
+      const managed = self.clients.get(clientName);
+      if (!managed) return yield* Effect.fail(new McpManagerError({ message: `MCP server "${clientName}" is not connected` }));
+      if (!managed.client.getServerCapabilities()?.resources?.subscribe) return yield* Effect.fail(new McpManagerError({ message: `MCP server "${clientName}" does not support resource subscriptions` }));
+      const key = resourceSubscriptionKey(clientName, uri);
+      if (self.resourceSubscriptions.has(key)) return;
+      const timeout = managed.config.timeout ?? self.config.timeout ?? DEFAULT_TIMEOUT;
+      if (managed.client.getProtocolEra() === "modern") {
+        const subscription = yield* Effect.tryPromise({
+          try: () => managed.client.listen({ resourceSubscriptions: [uri] }, sdkRequestOptions(timeout, options.signal)),
+          catch: (error) => error,
+        });
+        self.resourceSubscriptions.set(key, { client: managed.client, subscription, uri });
+        return;
+      }
+      yield* Effect.tryPromise({
+        try: () => managed.client.subscribeResource({ uri }, sdkRequestOptions(timeout, options.signal)),
+        catch: (error) => error,
+      });
+      self.resourceSubscriptions.set(key, { client: managed.client, uri });
+    });
+  }
+
+  /** Cancels an active resource subscription. */
+  unsubscribeResource(clientName: string, uri: string, options: CancellableOptions) {
+    return Effect.runPromise(this.unsubscribeResourceEffect(clientName, uri, options));
+  }
+
+  /** Effect-native resource unsubscription. */
+  unsubscribeResourceEffect(clientName: string, uri: string, options: CancellableOptions) {
+    const key = resourceSubscriptionKey(clientName, uri);
+    const active = this.resourceSubscriptions.get(key);
+    this.resourceSubscriptions.delete(key);
+    if (!active) return Effect.void;
+    if (active.subscription) return Effect.tryPromise({ try: () => active.subscription!.close(), catch: (error) => error });
+    const managed = this.clients.get(clientName);
+    if (!managed || managed.client !== active.client) return Effect.void;
+    return Effect.tryPromise({
+      try: () => managed.client.unsubscribeResource({ uri }, sdkRequestOptions(managed.config.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT, options.signal)),
+      catch: (error) => error,
+    }).pipe(Effect.asVoid);
   }
 
   /** Lists prompts exposed by every connected MCP server. */
@@ -384,6 +505,14 @@ export class McpManager {
   supportsResources() {
     for (const managed of this.clients.values()) {
       if (managed.client.getServerCapabilities()?.resources) return true;
+    }
+    return false;
+  }
+
+  /** Reports whether any connected MCP server currently supports completions. */
+  supportsCompletions() {
+    for (const managed of this.clients.values()) {
+      if (managed.client.getServerCapabilities()?.completions) return true;
     }
     return false;
   }
@@ -571,18 +700,18 @@ export class McpManager {
     return Effect.gen(function* () {
       const url = URL.canParse(serverConfig.url) ? new URL(serverConfig.url) : undefined;
       if (!url) return { status: { status: "failed", error: `Invalid MCP URL for "${name}"` } } satisfies ConnectionResult;
+      let primaryTransport: StreamableHTTPClientTransport | undefined;
       const authProvider = serverConfig.oauth === false
         ? undefined
-        : self.trackOAuthProvider(name, new McpOAuthProvider(
-            name,
-            serverConfig.url,
-            typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined,
-            { onRedirect: () => undefined },
-            self.auth,
-          ));
+        : self.createOAuthProvider(name, serverConfig, (authorizationUrl) =>
+            primaryTransport && self.statuses.get(name)?.status === "connected"
+              ? self.finishInlineAuthorization(name, serverConfig, primaryTransport, authorizationUrl)
+              : undefined,
+          );
+      primaryTransport = new StreamableHTTPClientTransport(url, transportOptions(authProvider, serverConfig.headers, typeof serverConfig.oauth === "object" && serverConfig.oauth.skipIssuerMetadataValidation));
       const transports: TransportWithAuth[] = [
-        new StreamableHTTPClientTransport(url, transportOptions(authProvider, serverConfig.headers)),
-        new SSEClientTransport(url, transportOptions(authProvider, serverConfig.headers)),
+        primaryTransport,
+        new SSEClientTransport(url, transportOptions(authProvider, serverConfig.headers, typeof serverConfig.oauth === "object" && serverConfig.oauth.skipIssuerMetadataValidation)),
       ];
       let lastStatus: McpStatus | undefined;
       for (const transport of transports) {
@@ -595,7 +724,10 @@ export class McpManager {
         const message = errorMessage(result.failure);
         const isAuthError = result.failure instanceof UnauthorizedError || (!!authProvider && /oauth|authorization|unauthorized/i.test(message));
         if (isAuthError) {
-          if (/registration|client_id/i.test(message)) {
+          const grantType = typeof serverConfig.oauth === "object" ? serverConfig.oauth.grantType : undefined;
+          if (grantType && grantType !== "authorization_code") {
+            lastStatus = { status: "failed", error: message };
+          } else if (/registration|client_id/i.test(message)) {
             lastStatus = { status: "needs_client_registration", error: "Server does not support dynamic client registration. Provide oauth.clientId in config." };
           } else {
             self.pendingOAuthTransports.set(name, transport);
@@ -635,6 +767,12 @@ export class McpManager {
               });
             },
           },
+          prompts: {
+            onChanged: (error) => this.handleCatalogListChanged(server, "prompts", error),
+          },
+          resources: {
+            onChanged: (error) => this.handleCatalogListChanged(server, "resources", error),
+          },
         },
       },
     );
@@ -659,7 +797,23 @@ export class McpManager {
       logServerMessage(name, notification.params);
     });
 
+    client.setNotificationHandler('notifications/resources/updated', (notification: ResourceUpdatedNotification) => {
+      Promise.resolve(this.options.onResourceUpdated?.(name, notification.params.uri)).catch((error) => {
+        console.error(`[mcp:${name}] resource update handler failed: ${safeErrorSummary(error)}`);
+      });
+    });
+
     if (!client.getServerCapabilities()?.tools) return;
+  }
+
+  private handleCatalogListChanged(server: string, kind: "prompts" | "resources", error: Error | null) {
+    if (error) {
+      console.error(`[mcp:${server}] ${kind} list refresh failed: ${safeErrorSummary(error)}`);
+      return;
+    }
+    Promise.resolve(this.options.onCatalogChanged?.(server, kind)).catch((refreshError) => {
+      console.error(`[mcp:${server}] ${kind} list change handler failed: ${safeErrorSummary(refreshError)}`);
+    });
   }
 
   private handleToolListChanged(name: string, client: Client) {
@@ -693,6 +847,9 @@ export class McpManager {
       const serverConfig = yield* Effect.try({ try: () => self.requireRemote(name), catch: (error) => error });
       if (serverConfig.oauth === false) return yield* Effect.fail(new OAuthError({ message: `MCP server ${name} has OAuth disabled` }));
       const oauthConfig = typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined;
+      if (oauthConfig?.grantType && oauthConfig.grantType !== "authorization_code") {
+        return yield* Effect.fail(new OAuthError({ message: `MCP server ${name} uses non-interactive ${oauthConfig.grantType} authentication` }));
+      }
       const redirectUri = oauthConfig?.redirectUri ??
         (oauthConfig?.callbackPort ? `http://127.0.0.1:${oauthConfig.callbackPort}/mcp/oauth/callback` : undefined);
       const oauthState = randomHex();
@@ -709,7 +866,7 @@ export class McpManager {
           { onRedirect: (url) => { capturedUrl = url; } },
           self.auth,
         ));
-        transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions(authProvider, serverConfig.headers));
+        transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), transportOptions(authProvider, serverConfig.headers, oauthConfig?.skipIssuerMetadataValidation));
         const client = self.createClient(name);
         yield* Effect.tryPromise({ try: () => client.connect(transport!), catch: (error) => error });
         return { authorizationUrl: "", oauthState, callbackFiber, client, transport };
@@ -759,6 +916,81 @@ export class McpManager {
         );
       }),
     );
+  }
+
+  private finishInlineAuthorization(
+    name: string,
+    serverConfig: Extract<McpServerConfig, { type: "remote" }>,
+    transport: StreamableHTTPClientTransport,
+    authorizationUrl: URL,
+  ) {
+    const state = authorizationUrl.searchParams.get("state");
+    if (!state) return Promise.reject(new OAuthError({ message: "OAuth authorization URL is missing state" }));
+    const config = typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined;
+    const redirectUri = config?.redirectUri ??
+      (config?.callbackPort ? `http://127.0.0.1:${config.callbackPort}${OAUTH_CALLBACK_PATH}` : undefined);
+    const self = this;
+    return Effect.runPromise(Effect.gen(function* () {
+      yield* self.oauthCallbacks.startEffect(redirectUri);
+      const callbackFiber = Effect.runFork(self.oauthCallbacks.waitForResultEffect(name, state));
+      yield* self.openAuthorizationUrlEffect(authorizationUrl.toString());
+      const params = yield* Fiber.join(callbackFiber);
+      if (params.get("state") !== state) return yield* Effect.fail(new OAuthError({ message: "OAuth state mismatch" }));
+      yield* Effect.tryPromise({ try: () => transport.finishAuth(params), catch: (error) => error });
+    }));
+  }
+
+  private createOAuthProvider(
+    name: string,
+    serverConfig: Extract<McpServerConfig, { type: "remote" }>,
+    onRedirect: (url: URL) => void | Promise<void>,
+  ): OAuthClientProvider {
+    const config = typeof serverConfig.oauth === "object" ? serverConfig.oauth : undefined;
+    if (config?.grantType === "client_credentials") {
+      if (!config.clientId || !config.clientSecret) throw new Error("client_credentials requires oauth.clientId and oauth.clientSecret");
+      return new ClientCredentialsProvider({
+        clientId: config.clientId,
+        clientSecret: config.clientSecret,
+        ...(config.scope ? { scope: config.scope } : {}),
+        ...(config.expectedIssuer ? { expectedIssuer: config.expectedIssuer } : {}),
+      });
+    }
+    if (config?.grantType === "private_key_jwt") {
+      if (!config.clientId) throw new Error("private_key_jwt requires oauth.clientId");
+      const common = {
+        clientId: config.clientId,
+        ...(config.scope ? { scope: config.scope } : {}),
+        ...(config.expectedIssuer ? { expectedIssuer: config.expectedIssuer } : {}),
+      };
+      if (config.jwtBearerAssertion) return new StaticPrivateKeyJwtProvider({ ...common, jwtBearerAssertion: config.jwtBearerAssertion });
+      if (!config.privateKey || !config.algorithm) throw new Error("private_key_jwt requires oauth.privateKey and oauth.algorithm");
+      return new PrivateKeyJwtProvider({ ...common, privateKey: config.privateKey, algorithm: config.algorithm });
+    }
+    if (config?.grantType === "cross_app") {
+      if (!config.clientId || !config.clientSecret || !config.idpToken || !config.idpClientId) {
+        throw new Error("cross_app requires oauth.clientId, oauth.clientSecret, oauth.idpToken, and oauth.idpClientId");
+      }
+      return new CrossAppAccessProvider({
+        clientId: config.clientId,
+        clientSecret: config.clientSecret,
+        ...(config.expectedIssuer ? { expectedIssuer: config.expectedIssuer } : {}),
+        assertion: async (context) => {
+          const options = {
+            audience: context.authorizationServerUrl,
+            resource: context.resourceUrl,
+            idToken: config.idpToken!,
+            clientId: config.idpClientId!,
+            ...(config.idpClientSecret ? { clientSecret: config.idpClientSecret } : {}),
+            ...(context.scope ? { scope: context.scope } : {}),
+            fetchFn: context.fetchFn,
+          };
+          return config.idpTokenEndpoint
+            ? (await requestJwtAuthorizationGrant({ ...options, tokenEndpoint: config.idpTokenEndpoint })).jwtAuthGrant
+            : (await discoverAndRequestJwtAuthGrant({ ...options, idpUrl: config.idpUrl! })).jwtAuthGrant;
+        },
+      });
+    }
+    return this.trackOAuthProvider(name, new McpOAuthProvider(name, serverConfig.url, config, { onRedirect }, this.auth));
   }
 
   private trackOAuthProvider(server: string, provider: McpOAuthProvider): McpOAuthProvider {
@@ -822,7 +1054,21 @@ export class McpManager {
     const managed = this.clients.get(name);
     this.clients.delete(name);
     this.statuses.set(name, status);
-    return managed ? safeCloseClientEffect(managed.client, managed.transport) : Effect.void;
+    return this.closeResourceSubscriptionsEffect(name).pipe(
+      Effect.andThen(managed ? safeCloseClientEffect(managed.client, managed.transport) : Effect.void),
+    );
+  }
+
+  private closeResourceSubscriptionsEffect(server?: string) {
+    const subscriptions = Array.from(this.resourceSubscriptions.entries()).filter(([key]) => !server || key.startsWith(`${server}\u0000`));
+    for (const [key] of subscriptions) this.resourceSubscriptions.delete(key);
+    return Effect.forEach(
+      subscriptions,
+      ([, active]) => active.subscription
+        ? Effect.tryPromise({ try: () => active.subscription!.close(), catch: (error) => error }).pipe(Effect.ignore)
+        : Effect.void,
+      { concurrency: "unbounded", discard: true },
+    );
   }
 
   private closePendingOAuthTransportsEffect() {
@@ -837,11 +1083,11 @@ export class McpManager {
   private closeClientsEffect() {
     const clients = Array.from(this.clients.values());
     this.clients.clear();
-    return Effect.forEach(
+    return this.closeResourceSubscriptionsEffect().pipe(Effect.andThen(Effect.forEach(
       clients,
       (managed) => safeCloseClientEffect(managed.client, managed.transport),
       { concurrency: "unbounded", discard: true },
-    );
+    )));
   }
 
   private closeConnectionAttemptsEffect() {
@@ -915,9 +1161,14 @@ function definedProcessEnv() {
   return Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
 
-function transportOptions(authProvider: McpOAuthProvider | undefined, headers: Record<string, string> | undefined) {
+function transportOptions(
+  authProvider: OAuthClientProvider | undefined,
+  headers: Record<string, string> | undefined,
+  skipIssuerMetadataValidation = false,
+) {
   return {
     ...(authProvider ? { authProvider } : {}),
+    ...(skipIssuerMetadataValidation ? { skipIssuerMetadataValidation: true } : {}),
     ...(headers ? { requestInit: { headers } } : {}),
   };
 }
@@ -974,11 +1225,23 @@ function cloneServerConfig(config: McpServerConfig): McpServerConfig {
 function cloneOAuthConfig(config: OAuthConfig | false): OAuthConfig | false {
   if (config === false) return false;
   return {
+    ...(config.grantType !== undefined ? { grantType: config.grantType } : {}),
     ...(config.clientId !== undefined ? { clientId: config.clientId } : {}),
     ...(config.clientSecret !== undefined ? { clientSecret: config.clientSecret } : {}),
     ...(config.scope !== undefined ? { scope: config.scope } : {}),
     ...(config.callbackPort !== undefined ? { callbackPort: config.callbackPort } : {}),
     ...(config.redirectUri !== undefined ? { redirectUri: config.redirectUri } : {}),
+    ...(config.clientMetadataUrl !== undefined ? { clientMetadataUrl: config.clientMetadataUrl } : {}),
+    ...(config.expectedIssuer !== undefined ? { expectedIssuer: config.expectedIssuer } : {}),
+    ...(config.privateKey !== undefined ? { privateKey: config.privateKey } : {}),
+    ...(config.algorithm !== undefined ? { algorithm: config.algorithm } : {}),
+    ...(config.jwtBearerAssertion !== undefined ? { jwtBearerAssertion: config.jwtBearerAssertion } : {}),
+    ...(config.idpUrl !== undefined ? { idpUrl: config.idpUrl } : {}),
+    ...(config.idpTokenEndpoint !== undefined ? { idpTokenEndpoint: config.idpTokenEndpoint } : {}),
+    ...(config.idpToken !== undefined ? { idpToken: config.idpToken } : {}),
+    ...(config.idpClientId !== undefined ? { idpClientId: config.idpClientId } : {}),
+    ...(config.idpClientSecret !== undefined ? { idpClientSecret: config.idpClientSecret } : {}),
+    ...(config.skipIssuerMetadataValidation !== undefined ? { skipIssuerMetadataValidation: config.skipIssuerMetadataValidation } : {}),
   };
 }
 
@@ -1030,6 +1293,10 @@ function waitForConnectAttemptEffect<E, R>(attempt: Effect.Effect<McpStatus, E, 
     return Effect.sync(() => signal.removeEventListener("abort", handler));
   });
   return Effect.sync(() => signal.throwIfAborted()).pipe(Effect.andThen(Effect.race(attempt, aborted)));
+}
+
+function resourceSubscriptionKey(server: string, uri: string) {
+  return `${server}\u0000${uri}`;
 }
 
 function sdkRequestOptions(timeout: number, signal: AbortSignal | undefined) {

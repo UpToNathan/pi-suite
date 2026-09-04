@@ -5,7 +5,7 @@ import type { Tool } from "@modelcontextprotocol/client";
 import type { TSchema } from "typebox";
 import { Type } from "typebox";
 import { Effect, Fiber } from "effect";
-import { callMcpTool, callMcpToolEffect, formatResourceContent, formatResourceList, toolParameters } from "./catalog.js";
+import { formatResourceContent, formatResourceList, formatResourceTemplateList, toolParameters } from "./catalog.js";
 import { loadMcpConfigEffect } from "./config.js";
 import { formatMcpServerTarget, redactSecrets } from "./display.js";
 import { handlePiElicitation } from "./elicitation.js";
@@ -17,6 +17,8 @@ import { optionalString, requiredString } from "./tool-args.js";
 const MCP_PROXY_TOOL = "mcp";
 const LIST_MCP_RESOURCES_TOOL = "list_mcp_resources";
 const READ_MCP_RESOURCE_TOOL = "read_mcp_resource";
+const COMPLETE_MCP_RESOURCE_TOOL = "complete_mcp_resource";
+const WATCH_MCP_RESOURCE_TOOL = "watch_mcp_resource";
 const MAX_RENDERED_CALL_ARGS_CHARS = 1500;
 const MAX_PROXY_SEARCH_RESULTS = 30;
 
@@ -34,6 +36,19 @@ const ReadResourceParams = Type.Object({
   uri: Type.String({ description: "Resource URI exactly as returned by list_mcp_resources." }),
 });
 
+const WatchResourceParams = Type.Object({
+  server: Type.String({ description: "MCP server name exactly as returned by list_mcp_resources." }),
+  uri: Type.String({ description: "Concrete resource URI to watch." }),
+  subscribe: Type.Optional(Type.Boolean({ description: "True to subscribe (default), false to unsubscribe." })),
+});
+
+const CompleteResourceParams = Type.Object({
+  server: Type.String({ description: "MCP server name exactly as returned by list_mcp_resources." }),
+  uri: Type.String({ description: "Resource URI template exactly as returned by list_mcp_resources." }),
+  argument: Type.String({ description: "Template variable to complete." }),
+  value: Type.Optional(Type.String({ description: "Current variable prefix. Defaults to an empty string." })),
+});
+
 const McpProxyParams = Type.Object({
   tool: Type.Optional(Type.String({ description: "MCP tool name to call, usually the prefixed <server>_<tool> name from search/list." })),
   args: Type.Optional(Type.String({ description: "Tool arguments as a JSON object string, for example '{\"key\":\"value\"}'." })),
@@ -42,8 +57,10 @@ const McpProxyParams = Type.Object({
   search: Type.Optional(Type.String({ description: "Search MCP tools by server, name, and description." })),
   regex: Type.Optional(Type.Boolean({ description: "Treat search as a JavaScript regular expression instead of space-separated terms." })),
   server: Type.Optional(Type.String({ description: "Filter list/search/describe/call to a specific MCP server." })),
-  action: Type.Optional(Type.String({ description: "Optional action: 'status', 'resources', or 'read-resource'." })),
-  uri: Type.Optional(Type.String({ description: "Resource URI for action 'read-resource'." })),
+  action: Type.Optional(Type.String({ description: "Optional action: 'status', 'resources', 'read-resource', 'complete-resource', 'subscribe-resource', or 'unsubscribe-resource'." })),
+  uri: Type.Optional(Type.String({ description: "Resource URI or template for resource actions." })),
+  argument: Type.Optional(Type.String({ description: "Template variable for action 'complete-resource'." })),
+  value: Type.Optional(Type.String({ description: "Current variable prefix for action 'complete-resource'." })),
 });
 
 /** Registers the OpenCode-compatible MCP client extension with Pi. */
@@ -64,6 +81,9 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       onElicitation: (server, request) => handlePiElicitation(server, request, elicitationContexts.getStore() ?? latestContext),
       onToolsChanged: () => {
         registerDynamicTools();
+      },
+      onResourceUpdated: (server, uri) => {
+        latestContext?.ui.notify(`MCP resource updated: ${server} ${uri}`, "info");
       },
     });
     return manager;
@@ -138,17 +158,14 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         renderCall(args, theme) {
           return renderToolCall(entry.key, args, theme);
         },
-        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        async execute(_toolCallId, params, signal, onUpdate, ctx) {
           const latest = requireManager().getToolEntry(entry.key);
           if (!latest) throw new Error(`MCP tool ${entry.key} is not connected`);
-          const toolInput = {
-            client: latest.client,
-            tool: latest.tool,
-            args: isPlainRecord(params) ? params : {},
-            timeout: latest.timeout,
+          const effect = requireManager().callToolEffect(latest, isPlainRecord(params) ? params : {}, {
             signal,
-          };
-          return elicitationContexts.run(ctx ?? latestContext, () => callMcpTool(toolInput));
+            ...(onUpdate ? { onProgress: (progress: { progress: number; total?: number | undefined; message?: string | undefined }) => onUpdate(progressUpdate(progress)) } : {}),
+          });
+          return elicitationContexts.run(ctx ?? latestContext, () => Effect.runPromise(effect));
         },
       });
     }
@@ -156,6 +173,8 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     if (activeManager.supportsResources()) {
       current.add(LIST_MCP_RESOURCES_TOOL);
       current.add(READ_MCP_RESOURCE_TOOL);
+      if (activeManager.supportsCompletions()) current.add(COMPLETE_MCP_RESOURCE_TOOL);
+      current.add(WATCH_MCP_RESOURCE_TOOL);
       registerResourceTools();
     }
 
@@ -181,14 +200,14 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
       renderCall(args, theme) {
         return renderMcpProxyCall(args, theme);
       },
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, onUpdate, ctx) {
         latestContext = ctx ?? latestContext;
-        return elicitationContexts.run(ctx ?? latestContext, () => executeMcpProxy(params, signal));
+        return elicitationContexts.run(ctx ?? latestContext, () => executeMcpProxy(params, signal, onUpdate));
       },
     });
   }
 
-  function executeMcpProxy(params: unknown, signal: AbortSignal | undefined) {
+  function executeMcpProxy(params: unknown, signal: AbortSignal | undefined, onUpdate?: (result: ReturnType<typeof progressUpdate>) => void) {
     return Effect.runPromise(
       Effect.gen(function* () {
         const args = isPlainRecord(params) ? params : {};
@@ -198,8 +217,24 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
 
     if (action === "resources") return yield* proxyResourcesEffect(server, signal);
     if (action === "read-resource") return yield* proxyReadResourceEffect(server, optionalString(args, "uri"), signal);
+    if (action === "subscribe-resource" || action === "unsubscribe-resource") {
+      if (!server) return proxyText(`${action} requires \`server\`.`, { mode: action, error: "missing_server" });
+      const uri = optionalString(args, "uri");
+      if (!uri) return proxyText(`${action} requires \`uri\`.`, { mode: action, server, error: "missing_uri" });
+      yield* ensureProxyServerConnectedEffect(server, { signal });
+      if (action === "subscribe-resource") yield* requireManager().subscribeResourceEffect(server, uri, { signal });
+      else yield* requireManager().unsubscribeResourceEffect(server, uri, { signal });
+      return proxyText(`${action === "subscribe-resource" ? "Subscribed to" : "Unsubscribed from"} ${server} ${uri}.`, { mode: action, server, uri });
+    }
+    if (action === "complete-resource") return yield* proxyCompleteResourceEffect(
+      server,
+      optionalString(args, "uri"),
+      optionalString(args, "argument"),
+      optionalString(args, "value") ?? "",
+      signal,
+    );
     if (action !== undefined && action !== "status") {
-      return proxyText(`Unknown MCP action "${action}". Supported actions: status, resources, read-resource.`, {
+      return proxyText(`Unknown MCP action "${action}". Supported actions: status, resources, read-resource, complete-resource, subscribe-resource, unsubscribe-resource.`, {
         mode: "error",
         error: "unknown_action",
         action,
@@ -207,7 +242,7 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     }
 
     const tool = optionalString(args, "tool");
-    if (tool) return yield* proxyCallEffect(tool, parsedArgs, server, signal);
+    if (tool) return yield* proxyCallEffect(tool, parsedArgs, server, signal, onUpdate);
 
     const connect = optionalString(args, "connect");
     if (connect) return yield* proxyConnectEffect(connect);
@@ -224,17 +259,20 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     );
   }
 
-  function proxyCallEffect(toolName: string, args: Record<string, unknown>, server: string | undefined, signal: AbortSignal | undefined) {
+  function proxyCallEffect(
+    toolName: string,
+    args: Record<string, unknown>,
+    server: string | undefined,
+    signal: AbortSignal | undefined,
+    onUpdate?: (result: ReturnType<typeof progressUpdate>) => void,
+  ) {
     return Effect.gen(function* () {
         yield* ensureProxyToolMetadataEffect(toolName, server, { signal });
         const found = findProxyTool(toolName, server);
         if ("error" in found) return proxyText(found.error, found.details);
-        return yield* callMcpToolEffect({
-          client: found.entry.client,
-          tool: found.entry.tool,
-          args,
-          timeout: found.entry.timeout,
+        return yield* requireManager().callToolEffect(found.entry, args, {
           signal,
+          ...(onUpdate ? { onProgress: (progress: { progress: number; total?: number | undefined; message?: string | undefined }) => onUpdate(progressUpdate(progress)) } : {}),
         });
       });
   }
@@ -352,13 +390,18 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
     const sorted = [...result.resources].sort((a, b) =>
       `${a.client}\u0000${a.name}\u0000${a.uri}`.localeCompare(`${b.client}\u0000${b.name}\u0000${b.uri}`),
     );
+    const templates = [...result.templates].sort((a, b) =>
+      `${a.client}\u0000${a.name}\u0000${a.uriTemplate}`.localeCompare(`${b.client}\u0000${b.name}\u0000${b.uriTemplate}`),
+    );
     const response = {
       resources: formatResourceList(sorted),
+      resourceTemplates: formatResourceTemplateList(templates),
       ...(result.failures.length > 0 ? { failures: result.failures } : {}),
     };
         return proxyText(JSON.stringify(response, null, 2), {
           mode: "resources",
           count: sorted.length,
+          templates: templates.length,
           servers: resourceServers,
           failures: result.failures.length,
           ...(server ? { server } : {}),
@@ -378,6 +421,32 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
           details: { mode: "read-resource", server, uri, contents: formatted.count, images: formatted.images.length },
         };
       });
+  }
+
+  function proxyCompleteResourceEffect(
+    server: string | undefined,
+    uri: string | undefined,
+    argument: string | undefined,
+    value: string,
+    signal: AbortSignal | undefined,
+  ) {
+    return Effect.gen(function* () {
+      if (!server) return proxyText("complete-resource requires `server`.", { mode: "complete-resource", error: "missing_server" });
+      if (!uri) return proxyText("complete-resource requires `uri`.", { mode: "complete-resource", server, error: "missing_uri" });
+      if (!argument) return proxyText("complete-resource requires `argument`.", { mode: "complete-resource", server, error: "missing_argument" });
+      yield* ensureProxyServerConnectedEffect(server, { signal });
+      const result = yield* requireManager().completeEffect(server, {
+        ref: { type: "ref/resource", uri },
+        argument: { name: argument, value },
+      }, { signal });
+      return proxyText(JSON.stringify(result.completion, null, 2), {
+        mode: "complete-resource",
+        server,
+        uri,
+        argument,
+        count: result.completion.values.length,
+      });
+    });
   }
 
   function proxyStatus() {
@@ -480,17 +549,73 @@ export default function opencodeMcpExtension(pi: ExtensionAPI) {
         const sorted = [...result.resources].sort((a, b) =>
           `${a.client}\u0000${a.name}\u0000${a.uri}`.localeCompare(`${b.client}\u0000${b.name}\u0000${b.uri}`),
         );
+        const templates = [...result.templates].sort((a, b) =>
+          `${a.client}\u0000${a.name}\u0000${a.uriTemplate}`.localeCompare(`${b.client}\u0000${b.name}\u0000${b.uriTemplate}`),
+        );
         const response = {
           resources: formatResourceList(sorted),
+          resourceTemplates: formatResourceTemplateList(templates),
           ...(result.failures.length > 0 ? { failures: result.failures } : {}),
         };
         return {
           content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
           details: {
             count: sorted.length,
+            templates: templates.length,
             servers: resourceServers,
             failures: result.failures.length,
             ...(parsed.server ? { server: parsed.server } : {}),
+          },
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: WATCH_MCP_RESOURCE_TOOL,
+      label: "Watch MCP Resource",
+      description: "Subscribe or unsubscribe from update notifications for a concrete MCP resource.",
+      promptSnippet: "Watch an MCP resource for updates",
+      promptGuidelines: ["Use watch_mcp_resource only when ongoing updates to a concrete MCP resource matter."],
+      parameters: WatchResourceParams,
+      renderCall(args, theme) {
+        return renderToolCall(WATCH_MCP_RESOURCE_TOOL, args, theme);
+      },
+      async execute(_toolCallId, params, signal) {
+        const parsed = parseWatchResourceArgs(params);
+        if (parsed.subscribe) await requireManager().subscribeResource(parsed.server, parsed.uri, { signal });
+        else await requireManager().unsubscribeResource(parsed.server, parsed.uri, { signal });
+        return {
+          content: [{ type: "text", text: `${parsed.subscribe ? "Subscribed to" : "Unsubscribed from"} ${parsed.server} ${parsed.uri}.` }],
+          details: parsed,
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: COMPLETE_MCP_RESOURCE_TOOL,
+      label: "Complete MCP Resource",
+      description: "Request completion candidates for one variable in an MCP resource URI template.",
+      promptSnippet: "Complete an MCP resource URI template variable",
+      promptGuidelines: [
+        "Use complete_mcp_resource with a URI template and variable returned by list_mcp_resources before reading a templated resource.",
+      ],
+      parameters: CompleteResourceParams,
+      renderCall(args, theme) {
+        return renderToolCall(COMPLETE_MCP_RESOURCE_TOOL, args, theme);
+      },
+      async execute(_toolCallId, params, signal) {
+        const parsed = parseCompleteResourceArgs(params);
+        const result = await requireManager().complete(parsed.server, {
+          ref: { type: "ref/resource", uri: parsed.uri },
+          argument: { name: parsed.argument, value: parsed.value },
+        }, { signal });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.completion, null, 2) }],
+          details: {
+            server: parsed.server,
+            uri: parsed.uri,
+            argument: parsed.argument,
+            count: result.completion.values.length,
           },
         };
       },
@@ -636,6 +761,14 @@ function proxyText(text: string, details: Record<string, unknown>) {
   return { content: [{ type: "text" as const, text }], details };
 }
 
+function progressUpdate(progress: { progress: number; total?: number | undefined; message?: string | undefined }) {
+  const amount = progress.total === undefined ? `${progress.progress}` : `${progress.progress}/${progress.total}`;
+  return {
+    content: [{ type: "text" as const, text: progress.message ? `${amount} — ${progress.message}` : amount }],
+    details: { progress },
+  };
+}
+
 function useProxyTool(config: McpConfig) {
   return config.toolMode === "proxy";
 }
@@ -675,6 +808,25 @@ function parseListResourcesArgs(value: unknown) {
 function parseReadResourceArgs(value: unknown) {
   const args = isPlainRecord(value) ? value : {};
   return { server: requiredString(args, "server"), uri: requiredString(args, "uri") };
+}
+
+function parseWatchResourceArgs(value: unknown) {
+  const args = isPlainRecord(value) ? value : {};
+  return {
+    server: requiredString(args, "server"),
+    uri: requiredString(args, "uri"),
+    subscribe: typeof args.subscribe === "boolean" ? args.subscribe : true,
+  };
+}
+
+function parseCompleteResourceArgs(value: unknown) {
+  const args = isPlainRecord(value) ? value : {};
+  return {
+    server: requiredString(args, "server"),
+    uri: requiredString(args, "uri"),
+    argument: requiredString(args, "argument"),
+    value: optionalString(args, "value") ?? "",
+  };
 }
 
 function formatStatus(name: string, serverConfig: McpConfig["servers"][string] | undefined, status: McpStatus) {
