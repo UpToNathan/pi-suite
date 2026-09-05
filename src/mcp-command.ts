@@ -3,7 +3,8 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { Effect } from "effect";
 import type { Prompt } from "@modelcontextprotocol/client";
 import { formatPromptMessages } from "./catalog.js";
-import { formatMcpServerTarget } from "./display.js";
+import { browseMcpEffect, inspectMcpTextEffect, pickMcpItemEffect } from "./mcp-browser.js";
+import { formatMcpServerTarget, redactSecrets } from "./display.js";
 import type { McpManager } from "./manager.js";
 import { showMcpManagerOverlay, type McpManagerView, type McpServerView } from "./mcp-manager-overlay.js";
 import type { McpConfig, McpStatus } from "./types.js";
@@ -83,8 +84,17 @@ export function runMcpCommand(
             ctx.ui.notify(`Removed OAuth credentials for ${action.server.name}`, "info");
           }
           continue;
+        case "tools":
+        case "resources":
+        case "capabilities":
+          yield* browseMcpEffect(ctx, manager, action.server.name, action._tag).pipe(
+            Effect.catch((error) => Effect.sync(() => ctx.ui.notify(mcpCommandError(error), "error"))),
+          );
+          continue;
         case "prompt": {
-          const sent = yield* runMcpPromptEffect(ctx, manager, action.server.name, dependencies.sendUserMessage);
+          const sent = yield* runMcpPromptEffect(ctx, manager, action.server.name, dependencies.sendUserMessage).pipe(
+            Effect.catch((error) => Effect.sync(() => { ctx.ui.notify(mcpCommandError(error), "error"); return false; })),
+          );
           if (sent) return;
           continue;
         }
@@ -157,10 +167,8 @@ function runMcpPromptEffect(
     return false;
   }
 
-  const choices = prompts.map((prompt) => formatPromptChoice(prompt));
-  const choice = yield* Effect.tryPromise({ try: () => ctx.ui.select(`MCP prompt — ${server}`, choices), catch: (error) => error });
-  if (choice === undefined) return false;
-  const selectedIndex = choices.indexOf(choice);
+  const selectedIndex = yield* pickMcpItemEffect(ctx, `MCP prompt — ${server}`, prompts.map((prompt) => ({ label: prompt.name, description: prompt.description ?? "" })));
+  if (selectedIndex === undefined) return false;
   const selected = prompts[selectedIndex];
   if (selected === undefined) return false;
 
@@ -176,6 +184,9 @@ function runMcpPromptEffect(
     ctx.ui.notify("MCP prompt returned no content", "warning");
     return false;
   }
+      const preview = content.map((block) => block.type === "text" ? block.text : "[Image attachment]").join("\n\n");
+      const confirmed = yield* inspectMcpTextEffect(ctx, `${server}/${selected.name} — prompt preview`, preview, "send prompt");
+      if (!confirmed) return false;
       sendUserMessage(content);
       return true;
     });
@@ -221,10 +232,6 @@ function collectPromptArgumentsEffect(ctx: ExtensionCommandContext, manager: Mcp
     });
 }
 
-function formatPromptChoice(prompt: Prompt): string {
-  return prompt.description ? `${prompt.name} — ${prompt.description}` : prompt.name;
-}
-
 function notifyConnectionStatus(ctx: ExtensionCommandContext, server: string, status: McpStatus): void {
   if (status.status === "connected") {
     ctx.ui.notify(`Connected MCP server ${server}`, "info");
@@ -245,7 +252,7 @@ function formatNonInteractiveStatus(manager: McpManager, config: McpConfig): str
 }
 
 function mcpCommandError(error: unknown): string {
-  return error instanceof Error ? `MCP manager operation failed: ${error.message}` : "MCP manager operation failed";
+  return error instanceof Error ? `MCP manager operation failed: ${redactSecrets(error.message)}` : "MCP manager operation failed";
 }
 
 function casesHandled(unexpectedCase: never): never {

@@ -113,7 +113,7 @@ interface ManagerOptions {
   authStore?: AuthStore;
   onCatalogChanged?: (server: string, kind: "prompts" | "resources") => void | Promise<void>;
   onResourceUpdated?: (server: string, uri: string) => void | Promise<void>;
-  onElicitation?: (server: string, request: ElicitRequest) => ElicitResult | Promise<ElicitResult>;
+  onElicitation?: (server: string, request: ElicitRequest, signal: AbortSignal) => ElicitResult | Promise<ElicitResult>;
   onToolsChanged?: (server: string) => void | Promise<void>;
   onStatusChanged?: () => void | Promise<void>;
   openAuthorizationUrl?: (url: string) => void | Promise<void>;
@@ -423,6 +423,14 @@ export class McpManager {
       });
       self.resourceSubscriptions.set(key, { client: managed.client, uri });
     });
+  }
+
+  /** Snapshot of active resource URIs for a currently connected server. */
+  subscribedResources(server: string): string[] {
+    const client = this.clients.get(server)?.client;
+    return Array.from(this.resourceSubscriptions.entries())
+      .filter(([key, active]) => key.startsWith(`${server}\u0000`) && active.client === client)
+      .map(([, active]) => active.uri);
   }
 
   /** Cancels an active resource subscription. */
@@ -779,8 +787,8 @@ export class McpManager {
     client.setRequestHandler('roots/list', () =>
       Promise.resolve({ roots: [{ uri: pathToFileURL(this.options.cwd).href }] }),
     );
-    client.setRequestHandler('elicitation/create', (request) => {
-      return this.options.onElicitation?.(server, request) ?? { action: "decline" };
+    client.setRequestHandler('elicitation/create', (request, context) => {
+      return this.options.onElicitation?.(server, request, context.mcpReq.signal) ?? { action: "decline" };
     });
     return client;
   }

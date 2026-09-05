@@ -170,9 +170,9 @@ async function main() {
 
     const completion = await manager.complete("local", {
       ref: { type: "ref/prompt", name: "review" },
-      argument: { name: "topic", value: "Web" },
+      argument: { name: "topic", value: "M" },
     }, { signal: undefined });
-    assert.deepEqual(completion.completion.values, ["WebMCP"]);
+    assert.deepEqual(completion.completion.values, ["MCP"]);
 
     const resourceCompletion = await manager.complete("local", {
       ref: { type: "ref/resource", uri: "test://cities/{city}" },

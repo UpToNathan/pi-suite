@@ -156,34 +156,13 @@ function parseServer(value: unknown, defaultTimeout: number | undefined, pathLab
   if (!isPlainRecord(value)) {
     throw new Error(`Invalid MCP config in ${source}: ${pathLabel} must be an object`);
   }
-  if (value.type !== "local" && value.type !== "remote" && value.type !== "webmcp") {
-    throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.type must be "local", "remote", or "webmcp"`);
+  if (value.type !== "local" && value.type !== "remote") {
+    throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.type must be "local" or "remote"`);
   }
 
   const timeout = parseOptionalPositiveInt(value.timeout, `${pathLabel}.timeout`, source) ?? defaultTimeout;
   const enabled = typeof value.enabled === "boolean" ? value.enabled : undefined;
   const disabled = typeof value.disabled === "boolean" ? value.disabled : undefined;
-
-  if (value.type === "webmcp") {
-    if (!Array.isArray(value.allowedOrigins) || value.allowedOrigins.length === 0 || !value.allowedOrigins.every((origin) => typeof origin === "string" && URL.canParse(origin))) {
-      throw new Error(`Invalid MCP config in ${source}: ${pathLabel}.allowedOrigins must be a non-empty array of absolute origins`);
-    }
-    const port = parseOptionalPositiveInt(value.port, `${pathLabel}.port`, source);
-    return {
-      type: "local",
-      command: [
-        "npx",
-        "--yes",
-        "@mcp-b/webmcp-local-relay@5.1.0",
-        "--widget-origin",
-        value.allowedOrigins.join(","),
-        ...(port ? ["--port", String(port)] : []),
-      ],
-      ...(enabled !== undefined ? { enabled } : {}),
-      ...(disabled !== undefined ? { disabled } : {}),
-      ...(timeout !== undefined ? { timeout } : {}),
-    };
-  }
 
   if (value.type === "local") {
     const command = parseCommand(value.command, `${pathLabel}.command`, source);

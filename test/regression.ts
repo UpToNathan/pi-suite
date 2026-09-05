@@ -20,7 +20,6 @@ async function main() {
   await mergesProjectConfigs();
   await loadsProxyToolMode();
   await loadsStartupMode();
-  await loadsWebMcpRelay();
   await rejectsMissingEnvironmentPlaceholder();
   redactsDisplayTargets();
   await rejectsMalformedAuthStoreData();
@@ -46,38 +45,6 @@ async function main() {
   console.log("regression ok");
 }
 
-async function loadsWebMcpRelay() {
-  const dir = await mkdtemp(path.join(tmpdir(), "pi-mcp-webmcp-"));
-  await writeFile(path.join(dir, "opencode.json"), JSON.stringify({
-    mcp: {
-      browser: {
-        type: "webmcp",
-        allowedOrigins: ["https://app.example.com"],
-        port: 9444,
-      },
-      machine: {
-        type: "remote",
-        url: "https://mcp.example.com",
-        oauth: {
-          grantType: "private_key_jwt",
-          clientId: "client",
-          privateKey: "key",
-          algorithm: "ES256",
-        },
-      },
-    },
-  }));
-  const config = await loadMcpConfig({ cwd: dir });
-  const browser = config.servers.browser;
-  assert.equal(browser?.type, "local");
-  assert.deepEqual(browser.type === "local" ? browser.command : [], [
-    "npx", "--yes", "@mcp-b/webmcp-local-relay@5.1.0", "--widget-origin", "https://app.example.com", "--port", "9444",
-  ]);
-  const machine = config.servers.machine;
-  assert.equal(machine?.type, "remote");
-  assert.equal(machine?.type === "remote" && typeof machine.oauth === "object" ? machine.oauth.grantType : undefined, "private_key_jwt");
-}
-
 async function declinesUrlElicitationWithoutPrefetch() {
   const confirmations: string[] = [];
   let fetches = 0;
@@ -101,13 +68,12 @@ async function declinesUrlElicitationWithoutPrefetch() {
       {
         hasUI: true,
         ui: {
-          confirm: async (_title, message) => {
-            confirmations.push(message);
-            return false;
-          },
           input: async () => undefined,
           notify: () => undefined,
-          select: async () => undefined,
+          select: async (title) => {
+            confirmations.push(title);
+            return "Decline request";
+          },
         },
       },
     );
@@ -184,8 +150,8 @@ async function fencesAndScopesOAuthPersistence() {
 
 async function handlesEmptyFormElicitationConsentDecisions() {
   const cases = [
-    { decision: "Continue", expected: { action: "accept", content: {} } },
-    { decision: "Decline", expected: { action: "decline" } },
+    { decision: "Submit answers", expected: { action: "accept", content: {} } },
+    { decision: "Decline request", expected: { action: "decline" } },
     { decision: undefined, expected: { action: "cancel" } },
   ];
 
@@ -224,8 +190,9 @@ async function handlesEmptyFormElicitationConsentDecisions() {
     );
 
     assert.deepEqual(result, testCase.expected);
-    assert.deepEqual(optionSets[0], ["Continue", "Decline"]);
-    assert.equal(prompts[0], "MCP Input Request\nServer: executor\n\nApprove Executor tool call?");
+    assert.deepEqual(optionSets[0], ["Submit answers", "Decline request"]);
+    assert.match(prompts[0]!, /MCP Input Request — executor/);
+    assert.match(prompts[0]!, /Approve Executor tool call\?/);
   }
 }
 

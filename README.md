@@ -1,6 +1,6 @@
 # pi-suite
 
-Effect-native Pi suite, starting with OpenCode-style MCP client support.
+Effect-native Pi extensions for OpenCode-style MCP support and editor integration.
 
 ## Requirements
 
@@ -19,6 +19,10 @@ For a temporary run:
 ```bash
 pi -e /Users/dmmulroy/Documents/pi-suite
 ```
+
+## Neovim line references
+
+The line-reference extension expands GitHub-style references such as `@src/index.ts#L12-L20` into the exact numbered source lines before the agent starts. This is the format emitted by `chiron.nvim` when sending a visual selection, with or without an accompanying message. References are limited to 2,000 lines and 50,000 characters.
 
 ## Configuration
 
@@ -83,30 +87,6 @@ Eager connects run in parallel and do not block Pi's `session_start` handler.
 
 `${ENV_VAR}` placeholders in `environment`, `headers`, `url`, `cwd`, and OAuth string settings are expanded from the process environment.
 
-### WebMCP
-
-A `webmcp` server starts the pinned MCP-B loopback relay. `allowedOrigins` is required so arbitrary open pages cannot register tools:
-
-```jsonc
-{
-  "mcp": {
-    "browser": {
-      "type": "webmcp",
-      "allowedOrigins": ["https://app.example.com"],
-      "port": 9333
-    }
-  }
-}
-```
-
-The website must load the relay embed after registering its WebMCP tools:
-
-```html
-<script src="https://cdn.jsdelivr.net/npm/@mcp-b/webmcp-local-relay@5.1.0/dist/browser/embed.js"></script>
-```
-
-The relay supports native `document.modelContext`, `@mcp-b/global`, and the WebMCP polyfill. Pi receives live browser tools through ordinary MCP discovery, including tool-list changes.
-
 ### OAuth grant types
 
 `oauth.grantType` supports `authorization_code` (default), `client_credentials`, `private_key_jwt`, and `cross_app`. Client Metadata Document URLs, issuer compatibility, private keys, static JWT assertions, and IdP token-exchange settings are available through the corresponding camelCase OAuth fields documented by `OAuthConfig` in `src/types.ts`.
@@ -122,7 +102,10 @@ details without adding a separate slash command for every operation.
 - `d` disconnects it for the current runtime.
 - `a` starts OAuth when available.
 - `l` confirms and removes stored OAuth credentials.
-- `p` selects and sends one of the server's prompts.
+- `p` browses prompts, collects arguments with completions, and previews content before sending.
+- `t` searches tools and inspects descriptions, annotations, and input/output schemas without executing them.
+- `s` browses resources and URI templates, previews content, and manages subscriptions. Template variables offer server completions.
+- `i` shows negotiated protocol-era information, server capabilities/instructions, and active subscriptions.
 - `r` reloads configuration and reconnects enabled servers.
 - `esc` closes the manager.
 
@@ -168,13 +151,15 @@ MCP prompt argument completions are shown as choices in `/mcp` when the server a
 
 ## Elicitation
 
-The MCP client advertises form and URL elicitation support. Modern servers use 2026 multi-round-trip `input_required` results; legacy server-initiated elicitation remains supported through the same handlers. In TUI/RPC modes, form fields are mapped to Pi UI dialogs:
+The MCP client advertises form and URL elicitation support. Modern servers use 2026 multi-round-trip `input_required` results; legacy server-initiated elicitation uses the same UI.
 
-- string enums use `ctx.ui.select`
-- booleans use `ctx.ui.confirm`
-- strings, numbers, integers, and string arrays use `ctx.ui.input`
+In the TUI, requests open a keyboard-driven form showing the originating server and message. Fields support titled single/multi-select enums, booleans, text, numeric values, defaults, and optional omission. Free-form string arrays use JSON syntax. JSON Schema constraints are checked before submission; invalid input stays editable.
 
-URL elicitation asks for confirmation and then opens the URL in the browser. In print/JSON modes, elicitation declines by default so non-interactive runs do not hang.
+Use `Tab` / `Shift+Tab` to move between fields and review, `↑↓` or numbers for choices, `Space` to toggle multi-select choices, and `Enter` to save/continue. `Ctrl+O` omits an optional field; server-side defaults may still apply. On the review page, select an answer and press `Enter` to edit it, or select **Submit answers**. **Decline request** refuses the request; `Esc` cancels without sending partial answers. While editing an Other answer, `Esc` returns to choices. `PgUp` / `PgDn` scroll long content.
+
+URL requests show the destination and require explicit approval before opening an HTTP(S) URL. Passwords and API keys belong in that browser flow, not in form answers. RPC uses sequential native dialogs and a final review; print/JSON declines by default. Concurrent question/form requests queue, and cancellation dismisses active input.
+
+Resource and schema inspectors are read-only and do not add their contents to the model context. Previews are capped at 50,000 characters; resource previews are text-only (images remain available through MCP resource tools).
 
 For deterministic non-interactive runs, set `PI_MCP_ELICITATION_RESPONSE` to either an elicitation result object:
 
@@ -183,6 +168,26 @@ PI_MCP_ELICITATION_RESPONSE='{"action":"accept","content":{"name":"test","count"
 ```
 
 or directly to a content object, which is treated as an accepted response.
+
+## Structured questions
+
+The separate `ask_user_question` extension follows Claude Code's [AskUserQuestion contract](https://code.claude.com/docs/en/agent-sdk/user-input#question-format): 1–4 questions, 2–4 described options each, short headers (up to 12 characters), and single- or multi-select answers. The UI automatically adds **Other** for custom text and always requires review before submission.
+
+```js
+ask_user_question({
+  questions: [{
+    question: "Which storage should we use?",
+    header: "Storage",
+    options: [
+      { label: "SQLite (Recommended)", description: "Local, no separate service." },
+      { label: "Postgres", description: "Shared database for multiple writers." }
+    ],
+    multiSelect: false
+  }]
+})
+```
+
+Results map the original question text to the selected label, custom text, or an array for multi-select. Cancelled requests return no partial answers. Answers are limited to 4,000 characters each and stored in the tool result for transcript/branch replay; expand the result to review them. Optional plain-text `preview` fields support ASCII comparisons, not executable HTML. RPC uses dialogs; print/JSON reports the UI as unavailable rather than inventing answers.
 
 ## Local fixture
 

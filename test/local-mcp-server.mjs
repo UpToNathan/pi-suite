@@ -335,7 +335,7 @@ function createFixtureServer() {
       argsSchema: z.object({
               topic: completable(
                 z.string().describe("Topic to review"),
-                (value) => ["MCP", "WebMCP"].filter((topic) => topic.toLowerCase().startsWith(value.toLowerCase())),
+                (value) => ["MCP"].filter((topic) => topic.toLowerCase().startsWith(value.toLowerCase())),
               ),
             }),
     },

@@ -42,7 +42,8 @@ export type McpManagerAction =
   | { readonly _tag: "disconnect"; readonly server: McpServerView }
   | { readonly _tag: "authenticate"; readonly server: McpServerView }
   | { readonly _tag: "logout"; readonly server: McpServerView }
-  | { readonly _tag: "prompt"; readonly server: McpServerView };
+  | { readonly _tag: "prompt"; readonly server: McpServerView }
+  | { readonly _tag: "tools" | "resources" | "capabilities"; readonly server: McpServerView };
 
 /** Show the interactive MCP server manager over the current Pi transcript. */
 export async function showMcpManagerOverlay(
@@ -58,7 +59,6 @@ export async function showMcpManagerOverlay(
         anchor: "center",
         width: "90%",
         maxHeight: "82%",
-        minWidth: 72,
       },
     },
   );
@@ -103,10 +103,13 @@ class McpManagerOverlay {
     else if (data === "a" && server.authStatus !== undefined) this.done({ _tag: "authenticate", server });
     else if (data === "l" && server.authStatus !== undefined) this.done({ _tag: "logout", server });
     else if (data === "p" && server.hasPrompts) this.done({ _tag: "prompt", server });
+    else if (data === "t" && server.toolCount > 0) this.done({ _tag: "tools", server });
+    else if (data === "s" && server.hasResources) this.done({ _tag: "resources", server });
+    else if (data === "i" && server.status.status === "connected") this.done({ _tag: "capabilities", server });
   }
 
   render(width: number): string[] {
-    const innerWidth = Math.max(20, width - 2);
+    const innerWidth = Math.max(0, width - 2);
     const bodyHeight = this.getBodyHeight();
     const body = innerWidth < 60
       ? this.renderServerList(innerWidth, bodyHeight).map((line) => frameLine(this.theme, line, innerWidth))
@@ -120,11 +123,11 @@ class McpManagerOverlay {
       divider(this.theme, innerWidth),
       frameLine(
         this.theme,
-        this.theme.fg("dim", "↑↓ move • enter/c connect • d disconnect • a auth • l logout • p prompt • r reload • esc close"),
+        this.theme.fg("dim", "↑↓ move • c connect • d disconnect • a auth • l logout • p prompts • t tools • s resources • i info • r reload • esc close"),
         innerWidth,
       ),
       bottomBorder(this.theme, innerWidth),
-    ];
+    ].map((line) => truncateToWidth(line, Math.max(0, width)));
   }
 
   invalidate(): void {}
@@ -188,9 +191,10 @@ class McpManagerOverlay {
       "",
       `${this.theme.fg("muted", "Type:")} ${server.type}`,
       `${this.theme.fg("muted", "Status:")} ${server.status.status}`,
-      `${this.theme.fg("muted", "Tools:")} ${server.toolCount}`,
-      `${this.theme.fg("muted", "Prompts:")} ${server.hasPrompts ? "available" : "none"}`,
-      `${this.theme.fg("muted", "Resources:")} ${server.hasResources ? "available" : "none"}`,
+      `${this.theme.fg("muted", "Tools [t]:")} ${server.toolCount}`,
+      `${this.theme.fg("muted", "Prompts [p]:")} ${server.hasPrompts ? "available" : "none"}`,
+      `${this.theme.fg("muted", "Resources [s]:")} ${server.hasResources ? "available" : "none"}`,
+      this.theme.fg("dim", "[i] negotiated capabilities & subscriptions"),
     ];
     if (server.authStatus !== undefined) lines.push(`${this.theme.fg("muted", "OAuth:")} ${server.authStatus}`);
     if (server.status.status === "failed" || server.status.status === "needs_client_registration") {
@@ -217,7 +221,7 @@ class McpManagerOverlay {
 
   private getBodyHeight(): number {
     const rows = this.tui.terminal.rows ?? 30;
-    return clamp(Math.floor(rows * 0.62), 8, 30);
+    return clamp(Math.floor(rows * 0.82) - 7, 1, 30);
   }
 }
 
